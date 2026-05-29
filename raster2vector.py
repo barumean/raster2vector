@@ -51,20 +51,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
-    vec.add_argument("--mode", choices=["edge", "skeleton"], default="edge",
-                     help="edge: Canny-based; skeleton: centre-line thinning")
-    vec.add_argument("--min-line-length", type=int, default=50, metavar="PX",
+    vec.add_argument("--mode", choices=["edge", "skeleton"], default="skeleton",
+                     help="skeleton (default): 1-px centre-line; edge: Canny-based")
+    vec.add_argument("--pre-close-kernel", type=int, default=0, metavar="N",
+                     help="Kernel size for closing before skeletonise (fills thick "
+                          "stroke interior so a thick line → single centre-line). "
+                          "0=off. Try 5-15 for thick-line drawings.")
+    vec.add_argument("--min-line-length", type=int, default=30, metavar="PX",
                      help="Minimum Hough line segment length")
-    vec.add_argument("--max-gap", type=int, default=10, metavar="PX",
-                     help="Maximum gap to bridge between collinear Hough segments")
-    vec.add_argument("--hough-threshold", type=int, default=50, metavar="N",
-                     help="Accumulator threshold for HoughLinesP")
+    vec.add_argument("--max-gap", type=int, default=20, metavar="PX",
+                     help="Maximum gap bridged inside a Hough segment (px); "
+                          "raise to connect broken lines")
+    vec.add_argument("--hough-threshold", type=int, default=30, metavar="N",
+                     help="Accumulator threshold for HoughLinesP (lower = more lines)")
     vec.add_argument("--canny-low", type=int, default=50, metavar="N",
-                     help="Lower Canny hysteresis threshold")
+                     help="Lower Canny hysteresis threshold (edge mode only)")
     vec.add_argument("--canny-high", type=int, default=150, metavar="N",
-                     help="Upper Canny hysteresis threshold")
+                     help="Upper Canny hysteresis threshold (edge mode only)")
     vec.add_argument("--approx-epsilon", type=float, default=1.5, metavar="F",
                      help="Douglas-Peucker tolerance for polyline simplification")
+    vec.add_argument("--snap-radius", type=float, default=4.0, metavar="F",
+                     help="Snap endpoints within this distance (px) to the same "
+                          "point; 0 to disable")
     vec.add_argument("--no-merge-lines", action="store_true",
                      help="Disable collinear Hough segment merging")
     vec.add_argument("--text-separation", action="store_true",
@@ -189,6 +197,8 @@ def main(argv=None) -> int:
         approx_epsilon=args.approx_epsilon,
         mode=args.mode,
         merge_lines=not args.no_merge_lines,
+        snap_radius=args.snap_radius,
+        pre_close_kernel=args.pre_close_kernel,
     )
 
     if args.verbose:
