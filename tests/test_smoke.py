@@ -100,14 +100,36 @@ def test_morphology_options(square_image_path):
 
 
 def test_text_separation(tmp_path):
-    """Text separator returns two non-None masks without crashing."""
+    """A collinear row of character-like blobs is detected as text."""
     img = np.zeros((200, 200), dtype=np.uint8)
-    # Draw some small blobs that look like characters
+    # Draw a horizontal row of small blobs (a "text string")
     for x in range(20, 120, 15):
         cv2.rectangle(img, (x, 50), (x + 8, 62), 255, -1)
     text_mask, graphics_mask = separate_text_and_graphics(img)
     assert text_mask.shape == img.shape
     assert graphics_mask.shape == img.shape
+    assert np.count_nonzero(text_mask) > 0, "collinear blob row not detected as text"
+
+
+def test_text_separation_isolated_blobs_not_text(tmp_path):
+    """Two far-apart blobs (no collinear run of 3) are NOT labelled text."""
+    img = np.zeros((200, 200), dtype=np.uint8)
+    cv2.rectangle(img, (10, 10), (18, 22), 255, -1)
+    cv2.rectangle(img, (170, 170), (178, 182), 255, -1)
+    text_mask, _ = separate_text_and_graphics(img)
+    assert np.count_nonzero(text_mask) == 0
+
+
+def test_text_separation_collinear_required(tmp_path):
+    """Blobs spaced as a line are grouped; a stray off-line blob is excluded."""
+    img = np.zeros((200, 200), dtype=np.uint8)
+    for x in range(20, 140, 15):           # collinear row at y≈56
+        cv2.rectangle(img, (x, 50), (x + 8, 62), 255, -1)
+    cv2.rectangle(img, (100, 150), (108, 162), 255, -1)   # off-line stray
+    text_mask, _ = separate_text_and_graphics(img)
+    # The stray blob (around y=156) should not be painted as text.
+    assert text_mask[156, 104] == 0, "off-baseline blob wrongly grouped as text"
+    assert np.count_nonzero(text_mask) > 0
 
 
 def test_polarity_normalization_black_on_white(tmp_path):
