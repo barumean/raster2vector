@@ -1,3 +1,5 @@
+import os
+
 import ezdxf
 import numpy as np
 
@@ -29,8 +31,13 @@ def export_to_dxf(
     """
     pixel_to_unit = 25.4 / dpi if units_mm else 1.0 / dpi
 
+    # Create parent directories if they don't exist
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     doc = ezdxf.new(dxfversion="R2010")
-    doc.units = 4  # 4 = millimetres in DXF
+    doc.units = 4 if units_mm else 1  # 4 = mm, 1 = inches
 
     msp = doc.modelspace()
 
@@ -53,7 +60,9 @@ def export_to_dxf(
     # Add LWPOLYLINE entities for remaining contour shapes
     for contour in contours:
         dxf_points = [px_to_dxf(float(pt[0]), float(pt[1])) for pt in contour]
-        msp.add_lwpolyline(dxf_points, dxfattribs={"layer": "contours"})
+        first, last = contour[0], contour[-1]
+        is_closed = bool(np.linalg.norm(first.astype(float) - last.astype(float)) < 2.0)
+        msp.add_lwpolyline(dxf_points, close=is_closed, dxfattribs={"layer": "contours"})
         entity_count += 1
 
     doc.saveas(output_path)
