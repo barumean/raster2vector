@@ -66,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save a debug PNG alongside the DXF showing detected lines and contours.",
     )
     parser.add_argument(
+        "--output-preview",
+        default=None,
+        metavar="PATH",
+        help="Path for the preview PNG (default: <input_stem>_preview.png).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print processing statistics to stdout.",
@@ -162,7 +168,11 @@ def main(argv=None) -> int:
 
     # ── Optional preview ──────────────────────────────────────────────────────
     if args.preview:
-        preview_path = os.path.splitext(args.output)[0] + "_preview.png"
+        if args.output_preview:
+            preview_path = args.output_preview
+        else:
+            stem = os.path.splitext(os.path.basename(args.image))[0]
+            preview_path = stem + "_preview.png"
         save_preview(original_bgr, lines, contours, preview_path)
         if args.verbose:
             print(f"Preview saved to '{preview_path}'.")

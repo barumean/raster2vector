@@ -75,12 +75,12 @@ def test_full_pipeline(synthetic_image_path, dxf_output_path):
     entities = list(msp)
     assert len(entities) >= 1, f"DXF modelspace has no entities (entity_count={entity_count})"
 
-    # 5. Run ezdxf auditor — must report zero violations
+    # 5. Run ezdxf auditor — must report zero errors
     auditor = doc.audit()
-    violations = list(auditor.violations)
-    assert len(violations) == 0, (
-        f"DXF audit found {len(violations)} violation(s):\n"
-        + "\n".join(str(v) for v in violations)
+    errors = list(auditor.errors)
+    assert len(errors) == 0, (
+        f"DXF audit found {len(errors)} error(s):\n"
+        + "\n".join(str(e) for e in errors)
     )
 
 
@@ -97,4 +97,4 @@ def test_export_empty(tmp_path):
     assert count == 0
     doc = ezdxf.readfile(output)
     auditor = doc.audit()
-    assert len(list(auditor.violations)) == 0
+    assert len(list(auditor.errors)) == 0
