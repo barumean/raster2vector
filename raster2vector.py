@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -51,25 +52,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
-    vec.add_argument("--mode", choices=["edge", "skeleton"], default="skeleton",
-                     help="skeleton (default): 1-px centre-line; edge: Canny-based")
+    vec.add_argument("--mode", choices=["edge", "skeleton"], default="edge",
+                     help="edge (default): contour-first + Canny on grayscale; "
+                          "skeleton: deprecated, treated as edge")
     vec.add_argument("--pre-close-kernel", type=int, default=0, metavar="N",
-                     help="Kernel size for closing before skeletonise (fills thick "
-                          "stroke interior so a thick line → single centre-line). "
-                          "0=off. Try 5-15 for thick-line drawings.")
-    vec.add_argument("--min-line-length", type=int, default=30, metavar="PX",
-                     help="Minimum Hough line segment length")
-    vec.add_argument("--max-gap", type=int, default=20, metavar="PX",
-                     help="Maximum gap bridged inside a Hough segment (px); "
-                          "raise to connect broken lines")
+                     help="Morphological closing before edge detection to fill thick "
+                          "stroke interiors. 0=off. Try 5-15 for thick drawings.")
+    vec.add_argument("--min-contour-length", type=float, default=15.0, metavar="F",
+                     help="Minimum contour arc length in pixels (shorter discarded)")
+    vec.add_argument("--min-contour-area", type=float, default=10.0, metavar="F",
+                     help="Minimum contour bounding-box area in pixels (smaller discarded)")
+    vec.add_argument("--max-line-deviation", type=float, default=2.0, metavar="F",
+                     help="Max perpendicular deviation (px) to classify a simplified "
+                          "contour as a straight LINE vs. LWPOLYLINE")
+    vec.add_argument("--no-hough", action="store_true",
+                     help="Disable supplemental Hough line detection")
+    vec.add_argument("--no-arcs", action="store_true",
+                     help="Disable circle/arc fitting (export curves as polylines only)")
+    vec.add_argument("--arc-tol", type=float, default=None, metavar="F",
+                     help="Max RMS pixel residual for circle/arc fitting "
+                          "(default: auto, 0.5%% of image diagonal)")
+    vec.add_argument("--min-line-length", type=int, default=80, metavar="PX",
+                     help="Minimum Hough line segment length (supplemental only)")
+    vec.add_argument("--max-gap", type=int, default=15, metavar="PX",
+                     help="Maximum gap bridged inside a Hough segment (px)")
     vec.add_argument("--hough-threshold", type=int, default=30, metavar="N",
                      help="Accumulator threshold for HoughLinesP (lower = more lines)")
     vec.add_argument("--canny-low", type=int, default=50, metavar="N",
                      help="Lower Canny hysteresis threshold (edge mode only)")
     vec.add_argument("--canny-high", type=int, default=150, metavar="N",
                      help="Upper Canny hysteresis threshold (edge mode only)")
-    vec.add_argument("--approx-epsilon", type=float, default=1.5, metavar="F",
-                     help="Douglas-Peucker tolerance for polyline simplification")
+    vec.add_argument("--approx-epsilon", type=float, default=None, metavar="F",
+                     help="Douglas-Peucker tolerance for polyline simplification "
+                          "(default: auto = max(1.5, 0.3%% of image diagonal))")
     vec.add_argument("--snap-radius", type=float, default=4.0, metavar="F",
                      help="Snap endpoints within this distance (px) to the same "
                           "point; 0 to disable")
@@ -101,6 +116,7 @@ def save_preview(
     contours: list,
     text_contours: list,
     preview_path: str,
+    arcs: list | None = None,
 ) -> bool:
     canvas = original_bgr.copy()
     for x1, y1, x2, y2 in lines:
@@ -108,6 +124,15 @@ def save_preview(
     for c in contours:
         pts = c.reshape(-1, 1, 2).astype(np.int32)
         cv2.polylines(canvas, [pts], False, (0, 255, 0), 1)         # green
+    for arc in (arcs or []):                                        # magenta
+        if arc.get("type") == "circle":
+            cx, cy = arc["center"]
+            cv2.circle(canvas, (int(round(cx)), int(round(cy))),
+                       int(round(arc["r"])), (255, 0, 255), 2)
+        elif arc.get("type") == "arc":
+            for p in (arc["start"], arc["mid"], arc["end"]):
+                cv2.circle(canvas, (int(round(p[0])), int(round(p[1]))),
+                           3, (255, 0, 255), -1)
     for c in text_contours:
         pts = c.reshape(-1, 1, 2).astype(np.int32)
         cv2.polylines(canvas, [pts], False, (0, 255, 255), 1)       # yellow
@@ -130,7 +155,7 @@ def main(argv=None) -> int:
         parser.error("--dpi must be a positive number.")
     if args.morph_kernel < 1:
         parser.error("--morph-kernel must be >= 1.")
-    if args.approx_epsilon <= 0:
+    if args.approx_epsilon is not None and args.approx_epsilon <= 0:
         parser.error("--approx-epsilon must be positive.")
     if args.adaptive_block_size < 3:
         parser.error("--adaptive-block-size must be >= 3.")
@@ -147,7 +172,7 @@ def main(argv=None) -> int:
 
     # ── 1. Preprocess ──────────────────────────────────────────────────────────
     try:
-        original_bgr, binary = load_and_preprocess(
+        original_bgr, gray, binary = load_and_preprocess(
             args.image,
             threshold_method=args.threshold_method,
             invert=args.invert,
@@ -172,12 +197,11 @@ def main(argv=None) -> int:
 
     # ── 2. Text / graphics separation ─────────────────────────────────────────
     text_contours: list = []
-    graphics_binary = binary
+    text_mask_img: Optional[np.ndarray] = None
 
     if args.text_separation:
-        text_mask, graphics_binary = separate_text_and_graphics(binary)
-        # Extract contour outlines from the text mask for DXF export
-        raw_tc, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
+        text_mask_img, _ = separate_text_and_graphics(binary)
+        raw_tc, _ = cv2.findContours(text_mask_img, cv2.RETR_EXTERNAL,
                                      cv2.CHAIN_APPROX_SIMPLE)
         for c in raw_tc:
             sq = c.squeeze()
@@ -187,14 +211,23 @@ def main(argv=None) -> int:
             print(f"Text candidates: {len(text_contours)} blobs")
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
-    lines, contours = extract_lines_and_contours(
-        graphics_binary,
+    lines, contours, arcs = extract_lines_and_contours(
+        binary,
+        gray=gray,
+        text_mask=text_mask_img,
+        min_contour_length=args.min_contour_length,
+        min_contour_area=args.min_contour_area,
+        max_line_deviation=args.max_line_deviation,
+        approx_epsilon=args.approx_epsilon,
+        use_hough=not args.no_hough,
         min_line_length=args.min_line_length,
         max_gap=args.max_gap,
         hough_threshold=args.hough_threshold,
         canny_low=args.canny_low,
         canny_high=args.canny_high,
-        approx_epsilon=args.approx_epsilon,
+        detect_arcs=not args.no_arcs,
+        arc_tol=args.arc_tol,
+        return_arcs=True,
         mode=args.mode,
         merge_lines=not args.no_merge_lines,
         snap_radius=args.snap_radius,
@@ -202,7 +235,7 @@ def main(argv=None) -> int:
     )
 
     if args.verbose:
-        print(f"Lines: {len(lines)}  Contours: {len(contours)}")
+        print(f"Lines: {len(lines)}  Contours: {len(contours)}  Arcs: {len(arcs)}")
 
     # ── 4. Export DXF ──────────────────────────────────────────────────────────
     try:
@@ -212,6 +245,7 @@ def main(argv=None) -> int:
             dpi=args.dpi,
             units_mm=True,
             text_mask_contours=text_contours,
+            arcs=arcs,
         )
     except (OSError, IOError) as exc:
         print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)
@@ -232,7 +266,8 @@ def main(argv=None) -> int:
         preview_path = args.output_preview or (
             os.path.splitext(os.path.basename(args.image))[0] + "_preview.png"
         )
-        ok = save_preview(original_bgr, lines, contours, text_contours, preview_path)
+        ok = save_preview(original_bgr, lines, contours, text_contours,
+                          preview_path, arcs=arcs)
         if ok and args.verbose:
             print(f"Preview → '{preview_path}'")
 
