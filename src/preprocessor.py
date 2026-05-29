@@ -36,8 +36,12 @@ def load_and_preprocess(
             9,
         )
 
-    # Morphological open to remove small noise specks
-    kernel = np.ones((2, 2), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Morphological open to remove small noise specks.
+    # Use a 3x3 kernel only when lines are thick enough (≥3px); skip for thin-line drawings
+    # where a 2x2 open would erase 1px-wide strokes entirely.
+    white_ratio = np.count_nonzero(binary) / binary.size
+    if white_ratio > 0.02:
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
     return img, binary

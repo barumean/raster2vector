@@ -95,16 +95,20 @@ def save_preview(
         pts = contour.reshape(-1, 1, 2).astype(np.int32)
         cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
 
-    cv2.imwrite(preview_path, canvas)
+    ok = cv2.imwrite(preview_path, canvas)
+    if not ok:
+        print(f"Warning: failed to save preview to '{preview_path}'.", file=sys.stderr)
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Validate manual threshold range
+    # Validate arguments
     if args.threshold is not None and not (0 <= args.threshold <= 255):
         parser.error("--threshold must be between 0 and 255.")
+    if args.dpi <= 0:
+        parser.error("--dpi must be a positive number.")
 
     # Determine output path
     if args.output is None:

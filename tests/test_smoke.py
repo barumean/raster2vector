@@ -1,7 +1,6 @@
 """Smoke test for the raster2vector pipeline."""
 
 import os
-import tempfile
 
 import cv2
 import ezdxf
