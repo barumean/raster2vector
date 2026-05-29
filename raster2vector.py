@@ -67,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
                           "contour as a straight LINE vs. LWPOLYLINE")
     vec.add_argument("--no-hough", action="store_true",
                      help="Disable supplemental Hough line detection")
+    vec.add_argument("--no-arcs", action="store_true",
+                     help="Disable circle/arc fitting (export curves as polylines only)")
+    vec.add_argument("--arc-tol", type=float, default=None, metavar="F",
+                     help="Max RMS pixel residual for circle/arc fitting "
+                          "(default: auto, 0.5%% of image diagonal)")
     vec.add_argument("--min-line-length", type=int, default=80, metavar="PX",
                      help="Minimum Hough line segment length (supplemental only)")
     vec.add_argument("--max-gap", type=int, default=15, metavar="PX",
@@ -110,6 +115,7 @@ def save_preview(
     contours: list,
     text_contours: list,
     preview_path: str,
+    arcs: list | None = None,
 ) -> bool:
     canvas = original_bgr.copy()
     for x1, y1, x2, y2 in lines:
@@ -117,6 +123,15 @@ def save_preview(
     for c in contours:
         pts = c.reshape(-1, 1, 2).astype(np.int32)
         cv2.polylines(canvas, [pts], False, (0, 255, 0), 1)         # green
+    for arc in (arcs or []):                                        # magenta
+        if arc.get("type") == "circle":
+            cx, cy = arc["center"]
+            cv2.circle(canvas, (int(round(cx)), int(round(cy))),
+                       int(round(arc["r"])), (255, 0, 255), 2)
+        elif arc.get("type") == "arc":
+            for p in (arc["start"], arc["mid"], arc["end"]):
+                cv2.circle(canvas, (int(round(p[0])), int(round(p[1]))),
+                           3, (255, 0, 255), -1)
     for c in text_contours:
         pts = c.reshape(-1, 1, 2).astype(np.int32)
         cv2.polylines(canvas, [pts], False, (0, 255, 255), 1)       # yellow
@@ -195,7 +210,7 @@ def main(argv=None) -> int:
             print(f"Text candidates: {len(text_contours)} blobs")
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
-    lines, contours = extract_lines_and_contours(
+    lines, contours, arcs = extract_lines_and_contours(
         binary,
         gray=gray,
         text_mask=text_mask_img,
@@ -209,6 +224,9 @@ def main(argv=None) -> int:
         hough_threshold=args.hough_threshold,
         canny_low=args.canny_low,
         canny_high=args.canny_high,
+        detect_arcs=not args.no_arcs,
+        arc_tol=args.arc_tol,
+        return_arcs=True,
         mode=args.mode,
         merge_lines=not args.no_merge_lines,
         snap_radius=args.snap_radius,
@@ -216,7 +234,7 @@ def main(argv=None) -> int:
     )
 
     if args.verbose:
-        print(f"Lines: {len(lines)}  Contours: {len(contours)}")
+        print(f"Lines: {len(lines)}  Contours: {len(contours)}  Arcs: {len(arcs)}")
 
     # ── 4. Export DXF ──────────────────────────────────────────────────────────
     try:
@@ -226,6 +244,7 @@ def main(argv=None) -> int:
             dpi=args.dpi,
             units_mm=True,
             text_mask_contours=text_contours,
+            arcs=arcs,
         )
     except (OSError, IOError) as exc:
         print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)
@@ -246,7 +265,8 @@ def main(argv=None) -> int:
         preview_path = args.output_preview or (
             os.path.splitext(os.path.basename(args.image))[0] + "_preview.png"
         )
-        ok = save_preview(original_bgr, lines, contours, text_contours, preview_path)
+        ok = save_preview(original_bgr, lines, contours, text_contours,
+                          preview_path, arcs=arcs)
         if ok and args.verbose:
             print(f"Preview → '{preview_path}'")
 

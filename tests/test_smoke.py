@@ -13,7 +13,9 @@ from src.vectorizer import (
     extract_lines_and_contours,
     _merge_collinear_lines,
     _snap_endpoints,
+    _fit_circle,
 )
+from src.dxf_exporter import _bulge_from_3pts
 from src.dxf_exporter import export_to_dxf
 
 
@@ -256,6 +258,64 @@ def test_approx_epsilon_option(square_image_path, dxf_out):
     lines, contours = extract_lines_and_contours(binary, approx_epsilon=3.0)
     count = export_to_dxf(lines, contours, dxf_out, image_height=binary.shape[0])
     assert count >= 0  # may be 0 for a simple image — just must not crash
+
+
+# ── Arc / circle (DXF Section 5) ───────────────────────────────────────────────
+
+def test_fit_circle_recovers_known_circle():
+    """Kåsa circle fit recovers a known centre and radius."""
+    cx0, cy0, r0 = 100.0, 80.0, 40.0
+    ang = np.linspace(0, 2 * np.pi, 60, endpoint=False)
+    pts = np.column_stack([cx0 + r0 * np.cos(ang), cy0 + r0 * np.sin(ang)])
+    cx, cy, r, resid = _fit_circle(pts)
+    assert abs(cx - cx0) < 1e-6 and abs(cy - cy0) < 1e-6
+    assert abs(r - r0) < 1e-6
+    assert resid < 1e-6
+
+
+def test_bulge_quarter_circle():
+    """A 90° CCW arc has bulge tan(90°/4) = tan(22.5°) ≈ 0.4142."""
+    # start (1,0) → mid (cos45,sin45) → end (0,1), centred at origin, CCW
+    s = (1.0, 0.0)
+    m = (np.cos(np.pi / 4), np.sin(np.pi / 4))
+    e = (0.0, 1.0)
+    b = _bulge_from_3pts(s, m, e)
+    assert abs(b - np.tan(np.pi / 8)) < 1e-6, b
+
+
+def test_bulge_sign_flips_with_direction():
+    """Reversing arc direction flips the bulge sign."""
+    s = (1.0, 0.0)
+    m = (np.cos(np.pi / 4), np.sin(np.pi / 4))
+    e = (0.0, 1.0)
+    assert _bulge_from_3pts(s, m, e) * _bulge_from_3pts(e, m, s) < 0
+
+
+def test_circle_detected_and_exported(tmp_path, dxf_out):
+    """A drawn circle is detected as an arc primitive and exported as CIRCLE."""
+    img = np.zeros((300, 300), dtype=np.uint8)
+    cv2.circle(img, (150, 150), 80, 255, 2)
+    path = str(tmp_path / "circle.png")
+    cv2.imwrite(path, img)
+    _, gray, binary = load_and_preprocess(path)
+    lines, contours, arcs = extract_lines_and_contours(
+        binary, gray=gray, return_arcs=True,
+    )
+    assert any(a["type"] == "circle" for a in arcs), f"no circle detected: {arcs}"
+    count = export_to_dxf(lines, contours, dxf_out,
+                          image_height=binary.shape[0], arcs=arcs)
+    assert count >= 1
+    doc = ezdxf.readfile(dxf_out)
+    assert len(list(doc.audit().errors)) == 0
+    assert any(e.dxftype() == "CIRCLE" for e in doc.modelspace())
+
+
+def test_return_arcs_false_keeps_two_tuple():
+    """Default 2-tuple API is preserved (no arc diversion)."""
+    img = _make_square()
+    binary = img  # already white-on-black foreground
+    result = extract_lines_and_contours(binary)
+    assert isinstance(result, tuple) and len(result) == 2
 
 
 def test_layer_names(square_image_path, dxf_out):

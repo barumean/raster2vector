@@ -121,6 +121,88 @@ def _simplify(contour_cv2: np.ndarray, epsilon: float) -> np.ndarray:
     return sq.astype(np.int32)
 
 
+# ── Circle / arc fitting (DXF Section 5: native ARC/CIRCLE + bulge) ────────────
+
+def _fit_circle(pts: np.ndarray) -> tuple[float, float, float, float]:
+    """Algebraic (Kåsa) least-squares circle fit.
+
+    Returns (cx, cy, r, rms_residual).  rms_residual is the root-mean-square
+    distance of the points from the fitted circle, in pixels.
+    """
+    x = pts[:, 0].astype(float)
+    y = pts[:, 1].astype(float)
+    A = np.column_stack([2.0 * x, 2.0 * y, np.ones(len(x))])
+    b = x * x + y * y
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = sol
+    r2 = c + cx * cx + cy * cy
+    if r2 <= 0:
+        return cx, cy, 0.0, float("inf")
+    r = float(np.sqrt(r2))
+    resid = float(np.sqrt(np.mean((np.hypot(x - cx, y - cy) - r) ** 2)))
+    return float(cx), float(cy), r, resid
+
+
+def _angular_span(pts: np.ndarray, cx: float, cy: float) -> float:
+    """Total angular coverage (radians, 0..2π) of points around a centre."""
+    ang = np.sort(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+    if len(ang) < 2:
+        return 0.0
+    gaps = np.diff(ang)
+    wrap = (ang[0] + 2 * np.pi) - ang[-1]
+    largest_gap = max(float(gaps.max()), float(wrap))
+    return 2 * np.pi - largest_gap
+
+
+def _try_fit_arc(
+    contour_pts: np.ndarray,
+    closed: bool,
+    arc_tol: float,
+    min_radius: float = 3.0,
+    max_radius_factor: float = 5.0,
+    image_diag: float = 1e9,
+) -> Optional[dict]:
+    """Attempt to model a contour as a circle or circular arc.
+
+    Returns a dict describing the primitive, or None if the points do not fit
+    a circle within ``arc_tol`` RMS pixels.
+
+    dict forms:
+      {"type": "circle", "center": (cx, cy), "r": r}
+      {"type": "arc",    "start": (x,y), "mid": (x,y), "end": (x,y)}
+
+    The arc form carries three pixel points; the DXF exporter derives the
+    bulge ``b = tan(theta/4)`` from them after the Y-flip, so arc orientation
+    survives the coordinate transform.
+    """
+    pts = contour_pts.reshape(-1, 2).astype(float)
+    if len(pts) < 5:
+        return None
+    cx, cy, r, resid = _fit_circle(pts)
+    if not np.isfinite(resid) or resid > arc_tol:
+        return None
+    if r < min_radius or r > image_diag * max_radius_factor:
+        return None
+
+    span = _angular_span(pts, cx, cy)
+    # Full circle: angular coverage near the whole 2π (a traced loop's
+    # endpoints rarely coincide exactly, so rely on span, not the closed flag).
+    if span >= np.deg2rad(300):
+        return {"type": "circle", "center": (cx, cy), "r": r}
+    # Partial arc: need a meaningful sweep, else a near-straight chord.
+    if span < np.deg2rad(20):
+        return None
+    start = pts[0]
+    end = pts[-1]
+    mid = pts[len(pts) // 2]
+    return {
+        "type": "arc",
+        "start": (float(start[0]), float(start[1])),
+        "mid": (float(mid[0]), float(mid[1])),
+        "end": (float(end[0]), float(end[1])),
+    }
+
+
 # ── Collinear Hough merge ─────────────────────────────────────────────────────
 
 def _segs_mergeable(a, b, angle_tol_deg, perp_tol, gap_tol) -> bool:
@@ -249,12 +331,16 @@ def extract_lines_and_contours(
     # Canny
     canny_low: int = 50,
     canny_high: int = 150,
+    # Arc / circle detection (DXF Section 5)
+    detect_arcs: bool = True,
+    arc_tol: Optional[float] = None,
+    return_arcs: bool = False,
     # Legacy / advanced
     mode: str = "edge",
     merge_lines: bool = True,
     snap_radius: float = 4.0,
     pre_close_kernel: int = 0,
-) -> tuple[list, list]:
+):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
     Contour extraction is the primary path (all visible geometry).
@@ -285,10 +371,20 @@ def extract_lines_and_contours(
         snap_radius  : Endpoint snap distance (px).  0 = disabled.
         pre_close_kernel: Closing before edge detection (0 = off).
 
+        detect_arcs  : Try to model curved contours as circles/arcs.
+        arc_tol      : Max RMS pixel residual for a circle fit.  None = auto
+                       (max(2.0, 0.5 %% of image diagonal)).
+        return_arcs  : When True, return a 3-tuple (lines, contours, arcs) and
+                       divert circle/arc-shaped contours into ``arcs``.  When
+                       False (default), behaves exactly as the 2-tuple API and
+                       does not divert any geometry.
+
     Returns:
-        (lines, contours)
+        (lines, contours)              when return_arcs is False
+        (lines, contours, arcs)        when return_arcs is True
         lines    : list of (x1, y1, x2, y2) int tuples — straight segments.
         contours : list of np.ndarray shape (N, 2) — polyline vertex arrays.
+        arcs     : list of dicts — {"type":"circle"|"arc", ...} primitives.
     """
     if mode == "skeleton":
         warnings.warn(
@@ -328,7 +424,9 @@ def extract_lines_and_contours(
     # ── Step 4-5: Simplify and classify each contour ─────────────────────────
     lines: list = []
     contours: list = []
+    arcs: list = []
     contour_mask = np.zeros_like(thin_edges)
+    arc_tolerance = arc_tol if arc_tol is not None else max(2.0, image_diag * 0.005)
 
     for c in filtered:
         pts = _simplify(c, eps)
@@ -341,6 +439,11 @@ def extract_lines_and_contours(
             # Entire simplified contour is straight → LINE entity
             lines.append((int(pts[0, 0]), int(pts[0, 1]),
                           int(pts[-1, 0]), int(pts[-1, 1])))
+        elif return_arcs and detect_arcs and (
+            arc := _try_fit_arc(c, closed, arc_tolerance, image_diag=image_diag)
+        ):
+            # Curved contour that fits a circle/arc → compact CAD primitive
+            arcs.append(arc)
         else:
             contours.append(pts)
 
@@ -375,4 +478,33 @@ def extract_lines_and_contours(
     if snap_radius > 0 and lines:
         lines = _snap_endpoints(lines, radius=snap_radius)
 
+    if return_arcs:
+        arcs = _dedup_circles(arcs)
+        return lines, contours, arcs
     return lines, contours
+
+
+def _dedup_circles(arcs: list, center_tol: float = 5.0, r_tol: float = 5.0) -> list:
+    """Collapse near-identical circles (e.g. the two edges of a thick stroke)."""
+    kept: list = []
+    for a in arcs:
+        if a.get("type") != "circle":
+            kept.append(a)
+            continue
+        cx, cy = a["center"]
+        r = a["r"]
+        dup = False
+        for b in kept:
+            if b.get("type") != "circle":
+                continue
+            bx, by = b["center"]
+            if abs(cx - bx) <= center_tol and abs(cy - by) <= center_tol \
+                    and abs(r - b["r"]) <= r_tol:
+                # Average to the stroke centre-line of the two edges.
+                b["center"] = ((cx + bx) / 2.0, (cy + by) / 2.0)
+                b["r"] = (r + b["r"]) / 2.0
+                dup = True
+                break
+        if not dup:
+            kept.append(a)
+    return kept
