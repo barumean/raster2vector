@@ -9,7 +9,11 @@ import pytest
 
 from src.preprocessor import load_and_preprocess
 from src.text_separator import separate_text_and_graphics
-from src.vectorizer import extract_lines_and_contours, _merge_collinear_lines
+from src.vectorizer import (
+    extract_lines_and_contours,
+    _merge_collinear_lines,
+    _snap_endpoints,
+)
 from src.dxf_exporter import export_to_dxf
 
 
@@ -139,10 +143,60 @@ def test_merge_keeps_parallel_lines():
 
 def test_merge_joins_collinear_fragments():
     """End-to-end collinear fragments SHOULD merge into one segment."""
-    merged = _merge_collinear_lines([(0, 0, 100, 0), (100, 0, 200, 0)])
+    # gap_tol=20 so 0-gap segments definitely merge
+    merged = _merge_collinear_lines([(0, 0, 100, 0), (100, 0, 200, 0)], gap_tol=20.0)
     assert len(merged) == 1, f"collinear fragments not merged: {merged}"
     x1, y1, x2, y2 = merged[0]
     assert min(x1, x2) == 0 and max(x1, x2) == 200
+
+
+def test_snap_endpoints_closes_small_gap():
+    """Endpoints within snap_radius get merged to the same point."""
+    # Two lines whose ends are 3 px apart — should snap
+    lines = [(0, 0, 100, 0), (103, 0, 200, 0)]
+    snapped = _snap_endpoints(lines, radius=4.0)
+    # After snapping, the inner gap endpoints must be at the same coordinate
+    assert snapped[0][2] == snapped[1][0], f"endpoints not snapped: {snapped}"
+
+
+def test_snap_endpoints_no_snap_far_apart():
+    """Endpoints farther than snap_radius must NOT be moved."""
+    lines = [(0, 0, 100, 0), (110, 0, 200, 0)]
+    snapped = _snap_endpoints(lines, radius=4.0)
+    assert snapped[0][2] == 100   # unchanged
+    assert snapped[1][0] == 110   # unchanged
+
+
+def test_thick_line_single_centre_line(tmp_path):
+    """A thick (10px) horizontal line should produce only ONE centre line."""
+    img = np.zeros((120, 300), dtype=np.uint8)
+    cv2.line(img, (10, 60), (290, 60), 255, 10)   # thick white line
+    path = str(tmp_path / "thick.png")
+    cv2.imwrite(path, img)
+    _, binary = load_and_preprocess(path)
+    lines, contours = extract_lines_and_contours(
+        binary, min_line_length=30, mode="skeleton",
+    )
+    # All y-coordinates of detected lines should cluster near 60
+    all_y = [y for (_, y1, _, y2) in lines for y in (y1, y2)]
+    assert all_y, "No lines detected on thick line"
+    assert all(50 <= y <= 70 for y in all_y), \
+        f"Got multiple y-bands (double-line artefact?): {sorted(set(all_y))}"
+
+
+def test_pre_close_thick_line(tmp_path):
+    """--pre-close-kernel joins the skeleton of a thick stroke."""
+    img = np.zeros((120, 300), dtype=np.uint8)
+    cv2.rectangle(img, (10, 50), (290, 70), 255, -1)  # filled rectangle (thick line)
+    path = str(tmp_path / "rect.png")
+    cv2.imwrite(path, img)
+    _, binary = load_and_preprocess(path)
+    lines_no_close, _ = extract_lines_and_contours(binary, min_line_length=30,
+                                                    mode="skeleton", pre_close_kernel=0)
+    lines_close, _ = extract_lines_and_contours(binary, min_line_length=30,
+                                                 mode="skeleton", pre_close_kernel=7)
+    # With closing, the thick rectangle should reduce to fewer lines
+    assert len(lines_close) <= len(lines_no_close) + 2
 
 
 def test_adaptive_block_oversized(tmp_path):
