@@ -192,9 +192,26 @@ def _try_fit_arc(
     # Partial arc: need a meaningful sweep, else a near-straight chord.
     if span < np.deg2rad(20):
         return None
-    start = pts[0]
-    end = pts[-1]
-    mid = pts[len(pts) // 2]
+
+    # Endpoints must be the two ends of the *angular* sweep, NOT pts[0]/pts[-1]:
+    # a contour traced from a thinned 2-px stroke runs out along the arc and
+    # loops back, so its first and last points nearly coincide.  Order points by
+    # angle about the centre, find the largest angular gap (the uncovered side),
+    # and rotate so the covered sweep is contiguous; its ends are the endpoints
+    # and its middle element is the mid point.
+    ang = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+    order = np.argsort(ang)
+    a_s = ang[order]
+    gaps = np.append(np.diff(a_s), (a_s[0] + 2 * np.pi) - a_s[-1])
+    g = int(np.argmax(gaps))
+    rot = np.concatenate([order[g + 1:], order[: g + 1]])
+    start = pts[rot[0]]
+    end = pts[rot[-1]]
+    mid = pts[rot[len(rot) // 2]]
+    # Guard: if the resolved endpoints are still nearly coincident, the shape is
+    # not a clean arc — let it fall back to a polyline.
+    if float(np.hypot(start[0] - end[0], start[1] - end[1])) < 3.0:
+        return None
     return {
         "type": "arc",
         "start": (float(start[0]), float(start[1])),
@@ -399,13 +416,14 @@ def extract_lines_and_contours(
     eps = approx_epsilon if approx_epsilon is not None else max(1.5, image_diag * 0.003)
 
     # ── Step 1: Build 1-px edge image ────────────────────────────────────────
+    # Canny runs on grayscale when available (preserves subtle tone boundaries),
+    # otherwise on the binary.  pre_close_kernel must be applied to whichever
+    # source actually feeds Canny, not to an unused copy.
+    canny_src = gray if gray is not None else binary
     if pre_close_kernel > 0:
         kc = np.ones((pre_close_kernel, pre_close_kernel), np.uint8)
-        work = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kc, iterations=1)
-    else:
-        work = binary
+        canny_src = cv2.morphologyEx(canny_src, cv2.MORPH_CLOSE, kc, iterations=1)
 
-    canny_src = gray if gray is not None else work
     edges = cv2.Canny(canny_src, canny_low, canny_high, apertureSize=3)
     thin_edges = _thin(edges)
 
@@ -484,27 +502,47 @@ def extract_lines_and_contours(
     return lines, contours
 
 
-def _dedup_circles(arcs: list, center_tol: float = 5.0, r_tol: float = 5.0) -> list:
-    """Collapse near-identical circles (e.g. the two edges of a thick stroke)."""
+def _dedup_circles(arcs: list, center_tol: float = 5.0, r_tol: float = 5.0,
+                   endpoint_tol: float = 6.0) -> list:
+    """Collapse near-identical primitives (the two edges of a thick stroke).
+
+    Circles are matched by centre + radius; arcs by their start/end endpoints
+    (in either orientation).  Duplicates are dropped, keeping the first.
+    """
     kept: list = []
     for a in arcs:
-        if a.get("type") != "circle":
-            kept.append(a)
-            continue
-        cx, cy = a["center"]
-        r = a["r"]
-        dup = False
-        for b in kept:
-            if b.get("type") != "circle":
-                continue
-            bx, by = b["center"]
-            if abs(cx - bx) <= center_tol and abs(cy - by) <= center_tol \
-                    and abs(r - b["r"]) <= r_tol:
-                # Average to the stroke centre-line of the two edges.
-                b["center"] = ((cx + bx) / 2.0, (cy + by) / 2.0)
-                b["r"] = (r + b["r"]) / 2.0
-                dup = True
-                break
-        if not dup:
+        if a.get("type") == "circle":
+            cx, cy = a["center"]
+            r = a["r"]
+            dup = False
+            for b in kept:
+                if b.get("type") != "circle":
+                    continue
+                bx, by = b["center"]
+                if abs(cx - bx) <= center_tol and abs(cy - by) <= center_tol \
+                        and abs(r - b["r"]) <= r_tol:
+                    b["center"] = ((cx + bx) / 2.0, (cy + by) / 2.0)
+                    b["r"] = (r + b["r"]) / 2.0
+                    dup = True
+                    break
+            if not dup:
+                kept.append(a)
+        elif a.get("type") == "arc":
+            s, e = np.array(a["start"]), np.array(a["end"])
+            dup = False
+            for b in kept:
+                if b.get("type") != "arc":
+                    continue
+                bs, be = np.array(b["start"]), np.array(b["end"])
+                same = (np.linalg.norm(s - bs) <= endpoint_tol
+                        and np.linalg.norm(e - be) <= endpoint_tol)
+                flipped = (np.linalg.norm(s - be) <= endpoint_tol
+                           and np.linalg.norm(e - bs) <= endpoint_tol)
+                if same or flipped:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(a)
+        else:
             kept.append(a)
     return kept

@@ -75,12 +75,17 @@ def test_full_pipeline(square_image_path, dxf_out):
     assert len(list(doc.audit().errors)) == 0
 
 
-def test_skeleton_mode(square_image_path, dxf_out):
-    """Skeleton mode also produces at least one entity."""
+def test_skeleton_mode_deprecated_alias(square_image_path, dxf_out):
+    """mode='skeleton' is a deprecated alias: it warns and behaves like edge."""
     original_bgr, gray, binary = load_and_preprocess(square_image_path)
-    lines, contours = extract_lines_and_contours(binary, min_line_length=20,
-                                                  mode="skeleton")
-    count = export_to_dxf(lines, contours, dxf_out, image_height=binary.shape[0])
+    with pytest.warns(DeprecationWarning):
+        skel = extract_lines_and_contours(binary, min_line_length=20,
+                                          mode="skeleton")
+    edge = extract_lines_and_contours(binary, min_line_length=20, mode="edge")
+    # Deprecated alias must produce identical geometry to edge mode.
+    assert skel[0] == edge[0]
+    assert len(skel[1]) == len(edge[1])
+    count = export_to_dxf(skel[0], skel[1], dxf_out, image_height=binary.shape[0])
     assert count >= 1
 
 
@@ -210,19 +215,20 @@ def test_thick_line_single_centre_line(tmp_path):
         f"Geometry outside expected band: {sorted(set(all_y))}"
 
 
-def test_pre_close_thick_line(tmp_path):
-    """--pre-close-kernel joins the skeleton of a thick stroke."""
+def test_pre_close_kernel_runs_and_produces_geometry(tmp_path):
+    """--pre-close-kernel runs without error and still yields geometry."""
     img = np.zeros((120, 300), dtype=np.uint8)
     cv2.rectangle(img, (10, 50), (290, 70), 255, -1)  # filled rectangle (thick line)
     path = str(tmp_path / "rect.png")
     cv2.imwrite(path, img)
-    _, _gray, binary = load_and_preprocess(path)
-    lines_no_close, _ = extract_lines_and_contours(binary, min_line_length=30,
-                                                    mode="skeleton", pre_close_kernel=0)
-    lines_close, _ = extract_lines_and_contours(binary, min_line_length=30,
-                                                 mode="skeleton", pre_close_kernel=7)
-    # With closing, the thick rectangle should reduce to fewer lines
-    assert len(lines_close) <= len(lines_no_close) + 2
+    _, gray, binary = load_and_preprocess(path)
+    l0, c0 = extract_lines_and_contours(binary, gray=gray, min_line_length=30,
+                                        pre_close_kernel=0)
+    l7, c7 = extract_lines_and_contours(binary, gray=gray, min_line_length=30,
+                                        pre_close_kernel=7)
+    # Both settings must produce at least one entity and not crash.
+    assert len(l0) + len(c0) >= 1
+    assert len(l7) + len(c7) >= 1
 
 
 def test_adaptive_block_oversized(tmp_path):

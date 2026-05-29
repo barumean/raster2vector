@@ -30,7 +30,7 @@ def load_and_preprocess(
     adaptive_c: int = 9,
     despeckle: bool = True,
     min_speckle_area: int = 3,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load image and produce a binary image with foreground (strokes) = 255.
 
     The output polarity is normalised so that the drawing strokes are the

@@ -82,8 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Lower Canny hysteresis threshold (edge mode only)")
     vec.add_argument("--canny-high", type=int, default=150, metavar="N",
                      help="Upper Canny hysteresis threshold (edge mode only)")
-    vec.add_argument("--approx-epsilon", type=float, default=1.5, metavar="F",
-                     help="Douglas-Peucker tolerance for polyline simplification")
+    vec.add_argument("--approx-epsilon", type=float, default=None, metavar="F",
+                     help="Douglas-Peucker tolerance for polyline simplification "
+                          "(default: auto = max(1.5, 0.3%% of image diagonal))")
     vec.add_argument("--snap-radius", type=float, default=4.0, metavar="F",
                      help="Snap endpoints within this distance (px) to the same "
                           "point; 0 to disable")
@@ -154,7 +155,7 @@ def main(argv=None) -> int:
         parser.error("--dpi must be a positive number.")
     if args.morph_kernel < 1:
         parser.error("--morph-kernel must be >= 1.")
-    if args.approx_epsilon <= 0:
+    if args.approx_epsilon is not None and args.approx_epsilon <= 0:
         parser.error("--approx-epsilon must be positive.")
     if args.adaptive_block_size < 3:
         parser.error("--adaptive-block-size must be >= 3.")
