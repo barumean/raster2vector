@@ -9,7 +9,7 @@ import pytest
 
 from src.preprocessor import load_and_preprocess
 from src.text_separator import separate_text_and_graphics
-from src.vectorizer import extract_lines_and_contours
+from src.vectorizer import extract_lines_and_contours, _merge_collinear_lines
 from src.dxf_exporter import export_to_dxf
 
 
@@ -102,6 +102,71 @@ def test_text_separation(tmp_path):
     text_mask, graphics_mask = separate_text_and_graphics(img)
     assert text_mask.shape == img.shape
     assert graphics_mask.shape == img.shape
+
+
+def test_polarity_normalization_black_on_white(tmp_path):
+    """Black strokes on white background → foreground normalised to 255."""
+    img = np.full((120, 120), 255, dtype=np.uint8)  # white background
+    cv2.line(img, (10, 60), (110, 60), 0, 2)         # black line
+    path = str(tmp_path / "bow.png")
+    cv2.imwrite(path, img)
+    _, binary = load_and_preprocess(path)
+    # Foreground (the line) must be the white minority, not the page.
+    assert np.count_nonzero(binary) < binary.size / 2
+    assert np.count_nonzero(binary) > 0
+
+
+def test_skeleton_no_page_border_black_on_white(tmp_path):
+    """Skeleton mode must trace the actual stroke, not the page border."""
+    img = np.full((120, 120), 255, dtype=np.uint8)
+    cv2.line(img, (10, 60), (110, 60), 0, 2)
+    path = str(tmp_path / "bow.png")
+    cv2.imwrite(path, img)
+    _, binary = load_and_preprocess(path)
+    lines, contours = extract_lines_and_contours(binary, min_line_length=30,
+                                                 mode="skeleton")
+    # All detected geometry should sit near y≈60, never on the page edges (0/119).
+    all_y = [y for (_, y1, _, y2) in lines for y in (y1, y2)]
+    assert all_y, "skeleton mode found nothing"
+    assert all(40 <= y <= 80 for y in all_y), f"page-border artefact detected: {all_y}"
+
+
+def test_merge_keeps_parallel_lines():
+    """Distinct parallel lines must NOT be merged into one."""
+    merged = _merge_collinear_lines([(10, 35, 130, 35), (10, 39, 130, 39)])
+    assert len(merged) == 2, f"parallel lines were wrongly merged: {merged}"
+
+
+def test_merge_joins_collinear_fragments():
+    """End-to-end collinear fragments SHOULD merge into one segment."""
+    merged = _merge_collinear_lines([(0, 0, 100, 0), (100, 0, 200, 0)])
+    assert len(merged) == 1, f"collinear fragments not merged: {merged}"
+    x1, y1, x2, y2 = merged[0]
+    assert min(x1, x2) == 0 and max(x1, x2) == 200
+
+
+def test_adaptive_block_oversized(tmp_path):
+    """Oversized adaptive block size is clamped, not crashed."""
+    img = np.zeros((50, 50), dtype=np.uint8)
+    cv2.rectangle(img, (5, 5), (45, 45), 255, 2)
+    path = str(tmp_path / "small.png")
+    cv2.imwrite(path, img)
+    # Should not raise cv2.error
+    _, binary = load_and_preprocess(path, threshold_method="adaptive",
+                                    adaptive_block_size=100000001)
+    assert binary is not None
+
+
+def test_thin_grid_survives_default(tmp_path):
+    """A dense 1px grid must survive default preprocessing (despeckle, morph=none)."""
+    img = np.zeros((100, 100), dtype=np.uint8)
+    for i in range(0, 100, 10):
+        cv2.line(img, (0, i), (99, i), 255, 1)
+        cv2.line(img, (i, 0), (i, 99), 255, 1)
+    path = str(tmp_path / "grid.png")
+    cv2.imwrite(path, img)
+    _, binary = load_and_preprocess(path)  # defaults: morph=none, despeckle=True
+    assert np.count_nonzero(binary) > 0, "thin grid erased by default preprocessing"
 
 
 def test_load_nonexistent_image():
