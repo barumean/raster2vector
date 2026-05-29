@@ -36,12 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Manual threshold value; overrides --threshold-method")
     pre.add_argument("--invert", action="store_true",
                      help="Invert image before processing (white-on-black drawings)")
-    pre.add_argument("--morph", choices=["none", "open", "close"], default="open",
-                     help="Morphological post-processing after thresholding")
+    pre.add_argument("--morph", choices=["none", "open", "close"], default="none",
+                     help="Explicit morphology (opt-in; open/close can damage thin lines)")
     pre.add_argument("--morph-kernel", type=int, default=2, metavar="N",
                      help="Square kernel size for morphological op (pixels)")
+    pre.add_argument("--no-despeckle", action="store_true",
+                     help="Disable thin-line-safe removal of tiny isolated specks")
+    pre.add_argument("--min-speckle-area", type=int, default=3, metavar="N",
+                     help="Drop isolated components smaller than this area (pixels)")
     pre.add_argument("--adaptive-block-size", type=int, default=51, metavar="N",
-                     help="Block size for adaptive thresholding (odd integer ≥ 3)")
+                     help="Block size for adaptive thresholding (auto-clamped odd ≥ 3)")
     pre.add_argument("--adaptive-c", type=int, default=9, metavar="N",
                      help="Constant subtracted from mean in adaptive thresholding")
 
@@ -63,8 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Douglas-Peucker tolerance for polyline simplification")
     vec.add_argument("--no-merge-lines", action="store_true",
                      help="Disable collinear Hough segment merging")
-    vec.add_argument("--no-text-separation", action="store_true",
-                     help="Skip text/graphics separation step")
+    vec.add_argument("--text-separation", action="store_true",
+                     help="Separate text-like blobs onto the TEXT_CANDIDATES layer "
+                          "(off by default; may misclassify small symbols)")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -88,7 +93,7 @@ def save_preview(
     contours: list,
     text_contours: list,
     preview_path: str,
-) -> None:
+) -> bool:
     canvas = original_bgr.copy()
     for x1, y1, x2, y2 in lines:
         cv2.line(canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)      # red
@@ -101,6 +106,7 @@ def save_preview(
     ok = cv2.imwrite(preview_path, canvas)
     if not ok:
         print(f"Warning: failed to save preview to '{preview_path}'.", file=sys.stderr)
+    return bool(ok)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -118,6 +124,10 @@ def main(argv=None) -> int:
         parser.error("--morph-kernel must be >= 1.")
     if args.approx_epsilon <= 0:
         parser.error("--approx-epsilon must be positive.")
+    if args.adaptive_block_size < 3:
+        parser.error("--adaptive-block-size must be >= 3.")
+    if args.min_speckle_area < 0:
+        parser.error("--min-speckle-area must be >= 0.")
 
     # Output path
     if args.output is None:
@@ -138,9 +148,14 @@ def main(argv=None) -> int:
             morph_kernel=args.morph_kernel,
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
+            despeckle=not args.no_despeckle,
+            min_speckle_area=args.min_speckle_area,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except cv2.error as exc:
+        print(f"Error: image processing failed — {exc}", file=sys.stderr)
         return 1
 
     h, w = binary.shape[:2]
@@ -151,7 +166,7 @@ def main(argv=None) -> int:
     text_contours: list = []
     graphics_binary = binary
 
-    if not args.no_text_separation:
+    if args.text_separation:
         text_mask, graphics_binary = separate_text_and_graphics(binary)
         # Extract contour outlines from the text mask for DXF export
         raw_tc, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
@@ -180,15 +195,18 @@ def main(argv=None) -> int:
         print(f"Lines: {len(lines)}  Contours: {len(contours)}")
 
     # ── 4. Export DXF ──────────────────────────────────────────────────────────
-    entity_count = export_to_dxf(
-        lines, contours, args.output,
-        image_height=h,
-        dpi=args.dpi,
-        units_mm=True,
-        text_mask_contours=text_contours,
-    )
+    try:
+        total = export_to_dxf(
+            lines, contours, args.output,
+            image_height=h,
+            dpi=args.dpi,
+            units_mm=True,
+            text_mask_contours=text_contours,
+        )
+    except (OSError, IOError) as exc:
+        print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)
+        return 1
 
-    total = entity_count
     if total == 0:
         print(
             "Warning: no entities written to the DXF.\n"
@@ -204,8 +222,8 @@ def main(argv=None) -> int:
         preview_path = args.output_preview or (
             os.path.splitext(os.path.basename(args.image))[0] + "_preview.png"
         )
-        save_preview(original_bgr, lines, contours, text_contours, preview_path)
-        if args.verbose:
+        ok = save_preview(original_bgr, lines, contours, text_contours, preview_path)
+        if ok and args.verbose:
             print(f"Preview → '{preview_path}'")
 
     return 0
