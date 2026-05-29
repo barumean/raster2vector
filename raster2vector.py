@@ -13,6 +13,7 @@ from src.preprocessor import load_and_preprocess
 from src.text_separator import separate_text_and_graphics
 from src.vectorizer import extract_lines_and_contours
 from src.dxf_exporter import export_to_dxf
+from src.stroke_width import estimate_line_widths, estimate_contour_widths
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -93,6 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--text-separation", action="store_true",
                      help="Separate text-like blobs onto the TEXT_CANDIDATES layer "
                           "(off by default; may misclassify small symbols)")
+    vec.add_argument("--stroke-width", action="store_true",
+                     help="Estimate stroke width per entity (SPV) and write DXF "
+                          "lineweights so dimension lines vs. boundary lines differ")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -237,6 +241,17 @@ def main(argv=None) -> int:
     if args.verbose:
         print(f"Lines: {len(lines)}  Contours: {len(contours)}  Arcs: {len(arcs)}")
 
+    # ── 3b. Stroke-width estimation (SPV) ──────────────────────────────────────
+    line_weights: Optional[list] = None
+    contour_weights: Optional[list] = None
+    if args.stroke_width:
+        line_weights = estimate_line_widths(binary, lines, dpi=args.dpi)
+        contour_weights = estimate_contour_widths(binary, contours, dpi=args.dpi)
+        if args.verbose:
+            from collections import Counter
+            lw_counts = Counter(line_weights)
+            print(f"Line weights (1/100 mm): {dict(sorted(lw_counts.items()))}")
+
     # ── 4. Export DXF ──────────────────────────────────────────────────────────
     try:
         total = export_to_dxf(
@@ -246,6 +261,8 @@ def main(argv=None) -> int:
             units_mm=True,
             text_mask_contours=text_contours,
             arcs=arcs,
+            line_weights=line_weights,
+            contour_weights=contour_weights,
         )
     except (OSError, IOError) as exc:
         print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)

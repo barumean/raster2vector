@@ -15,7 +15,9 @@ from src.vectorizer import (
     _snap_endpoints,
     _fit_circle,
 )
-from src.dxf_exporter import _bulge_from_3pts
+from src.dxf_exporter import _bulge_from_3pts, export_to_dxf as _export
+from src.stroke_width import estimate_line_widths, estimate_contour_widths, _DXF_WEIGHTS
+from src.vectorizer import _zhang_suen_thin
 from src.dxf_exporter import export_to_dxf
 
 
@@ -337,6 +339,68 @@ def test_circle_detected_and_exported(tmp_path, dxf_out):
     assert len(list(doc.audit().errors)) == 0
     assert any(e.dxftype() == "CIRCLE" for e in doc.modelspace())
 
+
+# ── Zhang-Suen thinning ────────────────────────────────────────────────────────
+
+def test_zhang_suen_reduces_thick_line_to_1px():
+    """Zhang-Suen must thin a 10px-wide line to a 1px skeleton."""
+    img = np.zeros((60, 200), dtype=np.uint8)
+    cv2.rectangle(img, (10, 25), (190, 35), 255, -1)  # 11px thick
+    thinned = _zhang_suen_thin(img)
+    # Column widths across the thick region should be 1
+    col = thinned[10:50, 100]  # vertical slice at centre
+    assert col.sum() // 255 == 1, f"skeleton is wider than 1 px: {col.sum()//255}"
+
+
+def test_zhang_suen_preserves_connectivity():
+    """A closed rectangle skeleton must remain connected (no broken corners)."""
+    img = np.zeros((80, 80), dtype=np.uint8)
+    cv2.rectangle(img, (10, 10), (70, 70), 255, 3)
+    thinned = _zhang_suen_thin(img)
+    n_labels, *_ = cv2.connectedComponentsWithStats(thinned, connectivity=8)
+    assert n_labels == 2, f"skeleton broke into {n_labels - 1} component(s)"
+
+
+# ── SPV stroke-width estimation ───────────────────────────────────────────────
+
+def test_stroke_width_thin_line():
+    """A 1-px line must round to a lighter DXF weight than a 5-px line."""
+    img1 = np.zeros((50, 200), dtype=np.uint8)
+    cv2.line(img1, (5, 25), (195, 25), 255, 1)
+    img5 = np.zeros((50, 200), dtype=np.uint8)
+    cv2.line(img5, (5, 25), (195, 25), 255, 5)
+    w1 = estimate_line_widths(img1, [(5, 25, 195, 25)], dpi=96.0)[0]
+    w5 = estimate_line_widths(img5, [(5, 25, 195, 25)], dpi=96.0)[0]
+    assert w1 < w5, f"1px ({w1}) not lighter than 5px ({w5})"
+    assert w1 in _DXF_WEIGHTS
+
+
+def test_stroke_width_thick_line_heavier():
+    """A 10-px line must yield a heavier DXF weight than a 1-px line."""
+    img = np.zeros((50, 200), dtype=np.uint8)
+    cv2.line(img, (5, 25), (195, 25), 255, 10)
+    w_thick = estimate_line_widths(img, [(5, 25, 195, 25)], dpi=96.0)[0]
+    img2 = np.zeros((50, 200), dtype=np.uint8)
+    cv2.line(img2, (5, 25), (195, 25), 255, 1)
+    w_thin = estimate_line_widths(img2, [(5, 25, 195, 25)], dpi=96.0)[0]
+    assert w_thick > w_thin, f"thick {w_thick} not heavier than thin {w_thin}"
+
+
+def test_stroke_width_written_to_dxf(tmp_path):
+    """Lineweight attribute is accepted by ezdxf without audit errors."""
+    img = np.zeros((50, 200), dtype=np.uint8)
+    cv2.line(img, (5, 25), (195, 25), 255, 5)
+    lines = [(5, 25, 195, 25)]
+    weights = estimate_line_widths(img, lines, dpi=96.0)
+    out = str(tmp_path / "lw.dxf")
+    export_to_dxf(lines, [], out, image_height=50, line_weights=weights)
+    doc = ezdxf.readfile(out)
+    assert len(list(doc.audit().errors)) == 0
+    ent = list(doc.modelspace())[0]
+    assert ent.dxf.lineweight == weights[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def test_return_arcs_false_keeps_two_tuple():
     """Default 2-tuple API is preserved (no arc diversion)."""

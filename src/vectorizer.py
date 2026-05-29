@@ -40,20 +40,63 @@ except ImportError:
 
 # ── Thin edge images to 1 px ──────────────────────────────────────────────────
 
+def _zhang_suen_thin(img: np.ndarray) -> np.ndarray:
+    """Zhang-Suen parallel thinning algorithm (1984).
+
+    Two-pass iterative removal of border pixels while preserving 8-connectivity
+    and line endpoints.  Each pass applies the deletion conditions:
+
+    Common to both passes:
+      (1) 2 ≤ B(P1) ≤ 6   (non-isolated, non-fully-surrounded)
+      (2) A(P1) = 1        (exactly one 0→1 transition in the 3×3 ring)
+
+    Pass 1: P2·P4·P6 = 0  AND  P4·P6·P8 = 0
+    Pass 2: P2·P4·P8 = 0  AND  P2·P6·P8 = 0
+
+    Returns a 1-pixel-wide binary image (foreground = 255).
+    """
+    binary = (img > 0).astype(np.uint8)
+    while True:
+        changed = False
+        for odd_pass in (True, False):
+            h, w = binary.shape
+            # Pad for neighbour lookup
+            p = np.pad(binary, 1, constant_values=0)
+            P2 = p[0:h,   1:w+1]
+            P3 = p[0:h,   2:w+2]
+            P4 = p[1:h+1, 2:w+2]
+            P5 = p[2:h+2, 2:w+2]
+            P6 = p[2:h+2, 1:w+1]
+            P7 = p[2:h+2, 0:w]
+            P8 = p[1:h+1, 0:w]
+            P9 = p[0:h,   0:w]
+
+            # B(P1): count of foreground neighbours
+            B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9
+            # A(P1): 0→1 transitions in ring P2,P3,...,P9,P2
+            ring = np.stack([P2, P3, P4, P5, P6, P7, P8, P9], axis=2)
+            shifted = np.roll(ring, -1, axis=2)
+            A = ((ring == 0) & (shifted == 1)).sum(axis=2)
+
+            cond12 = (binary == 1) & (B >= 2) & (B <= 6) & (A == 1)
+            if odd_pass:
+                cond34 = (P2 * P4 * P6 == 0) & (P4 * P6 * P8 == 0)
+            else:
+                cond34 = (P2 * P4 * P8 == 0) & (P2 * P6 * P8 == 0)
+            delete = cond12 & cond34
+            if delete.any():
+                binary[delete] = 0
+                changed = True
+        if not changed:
+            break
+    return binary * 255
+
+
 def _thin(img: np.ndarray) -> np.ndarray:
     """Return a 1-pixel-wide version of a binary image (foreground = 255)."""
     if _SKIMAGE:
         return (_ski_skel(img > 0).astype(np.uint8)) * 255
-    # Fallback morphological thinning
-    skel, tmp = np.zeros_like(img), img.copy()
-    k = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    while True:
-        e = cv2.erode(tmp, k)
-        skel = cv2.bitwise_or(skel, cv2.subtract(tmp, cv2.dilate(e, k)))
-        tmp = e
-        if not cv2.countNonZero(tmp):
-            break
-    return skel
+    return _zhang_suen_thin(img)
 
 
 # ── Geometry helpers ──────────────────────────────────────────────────────────
