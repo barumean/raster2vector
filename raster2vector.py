@@ -9,177 +9,204 @@ import cv2
 import numpy as np
 
 from src.preprocessor import load_and_preprocess
+from src.text_separator import separate_text_and_graphics
 from src.vectorizer import extract_lines_and_contours
 from src.dxf_exporter import export_to_dxf
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="raster2vector",
         description="Convert a black-and-white raster image to a DXF vector file.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("image", help="Path to the input raster image (PNG, JPG, BMP, …)")
-    parser.add_argument(
-        "-o", "--output",
-        default=None,
-        help="Output DXF file path. Defaults to <input_stem>.dxf in the current directory.",
-    )
-    parser.add_argument(
-        "--threshold-method",
-        choices=["otsu", "adaptive"],
-        default="otsu",
-        help="Binarisation method (default: otsu).",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=None,
-        metavar="VALUE",
-        help="Manual threshold value 0-255. Overrides --threshold-method when provided.",
-    )
-    parser.add_argument(
-        "--invert",
-        action="store_true",
-        help="Invert the image before processing (useful for white-on-black drawings).",
-    )
-    parser.add_argument(
-        "--min-line-length",
-        type=int,
-        default=50,
-        help="Minimum length (pixels) for a Hough line segment to be kept (default: 50).",
-    )
-    parser.add_argument(
-        "--max-gap",
-        type=int,
-        default=10,
-        help="Maximum gap (pixels) to bridge between collinear Hough segments (default: 10).",
-    )
-    parser.add_argument(
-        "--dpi",
-        type=float,
-        default=96.0,
-        help="Source image resolution in DPI used for pixel→mm conversion (default: 96).",
-    )
-    parser.add_argument(
-        "--preview",
-        action="store_true",
-        help="Save a debug PNG alongside the DXF showing detected lines and contours.",
-    )
-    parser.add_argument(
-        "--output-preview",
-        default=None,
-        metavar="PATH",
-        help="Path for the preview PNG (default: <input_stem>_preview.png).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print processing statistics to stdout.",
-    )
-    return parser
 
+    p.add_argument("image", help="Input raster image (PNG, JPG, BMP, …)")
+    p.add_argument("-o", "--output", default=None,
+                   help="Output DXF path. Defaults to <input_stem>.dxf")
+
+    # ── Preprocessing ─────────────────────────────────────────────────────────
+    pre = p.add_argument_group("preprocessing")
+    pre.add_argument("--threshold-method", choices=["otsu", "adaptive"],
+                     default="otsu", metavar="METHOD",
+                     help="Binarisation method: otsu or adaptive")
+    pre.add_argument("--threshold", type=int, default=None, metavar="0-255",
+                     help="Manual threshold value; overrides --threshold-method")
+    pre.add_argument("--invert", action="store_true",
+                     help="Invert image before processing (white-on-black drawings)")
+    pre.add_argument("--morph", choices=["none", "open", "close"], default="open",
+                     help="Morphological post-processing after thresholding")
+    pre.add_argument("--morph-kernel", type=int, default=2, metavar="N",
+                     help="Square kernel size for morphological op (pixels)")
+    pre.add_argument("--adaptive-block-size", type=int, default=51, metavar="N",
+                     help="Block size for adaptive thresholding (odd integer ≥ 3)")
+    pre.add_argument("--adaptive-c", type=int, default=9, metavar="N",
+                     help="Constant subtracted from mean in adaptive thresholding")
+
+    # ── Vectorisation ─────────────────────────────────────────────────────────
+    vec = p.add_argument_group("vectorisation")
+    vec.add_argument("--mode", choices=["edge", "skeleton"], default="edge",
+                     help="edge: Canny-based; skeleton: centre-line thinning")
+    vec.add_argument("--min-line-length", type=int, default=50, metavar="PX",
+                     help="Minimum Hough line segment length")
+    vec.add_argument("--max-gap", type=int, default=10, metavar="PX",
+                     help="Maximum gap to bridge between collinear Hough segments")
+    vec.add_argument("--hough-threshold", type=int, default=50, metavar="N",
+                     help="Accumulator threshold for HoughLinesP")
+    vec.add_argument("--canny-low", type=int, default=50, metavar="N",
+                     help="Lower Canny hysteresis threshold")
+    vec.add_argument("--canny-high", type=int, default=150, metavar="N",
+                     help="Upper Canny hysteresis threshold")
+    vec.add_argument("--approx-epsilon", type=float, default=1.5, metavar="F",
+                     help="Douglas-Peucker tolerance for polyline simplification")
+    vec.add_argument("--no-merge-lines", action="store_true",
+                     help="Disable collinear Hough segment merging")
+    vec.add_argument("--no-text-separation", action="store_true",
+                     help="Skip text/graphics separation step")
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    out = p.add_argument_group("output")
+    out.add_argument("--dpi", type=float, default=96.0,
+                     help="Source image DPI for pixel→mm conversion")
+    out.add_argument("--preview", action="store_true",
+                     help="Save a debug PNG showing detected geometry")
+    out.add_argument("--output-preview", default=None, metavar="PATH",
+                     help="Path for preview PNG; defaults to <input_stem>_preview.png")
+    out.add_argument("--verbose", action="store_true",
+                     help="Print processing statistics")
+
+    return p
+
+
+# ── Preview renderer ──────────────────────────────────────────────────────────
 
 def save_preview(
     original_bgr: np.ndarray,
     lines: list,
     contours: list,
+    text_contours: list,
     preview_path: str,
 ) -> None:
-    """Render a debug PNG with detected lines (red) and contours (green)."""
     canvas = original_bgr.copy()
-
     for x1, y1, x2, y2 in lines:
-        cv2.line(canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
-    for contour in contours:
-        pts = contour.reshape(-1, 1, 2).astype(np.int32)
-        cv2.polylines(canvas, [pts], isClosed=False, color=(0, 255, 0), thickness=1)
-
+        cv2.line(canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)      # red
+    for c in contours:
+        pts = c.reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(canvas, [pts], False, (0, 255, 0), 1)         # green
+    for c in text_contours:
+        pts = c.reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(canvas, [pts], False, (0, 255, 255), 1)       # yellow
     ok = cv2.imwrite(preview_path, canvas)
     if not ok:
         print(f"Warning: failed to save preview to '{preview_path}'.", file=sys.stderr)
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Validate arguments
+    # Validate
     if args.threshold is not None and not (0 <= args.threshold <= 255):
         parser.error("--threshold must be between 0 and 255.")
     if args.dpi <= 0:
         parser.error("--dpi must be a positive number.")
+    if args.morph_kernel < 1:
+        parser.error("--morph-kernel must be >= 1.")
+    if args.approx_epsilon <= 0:
+        parser.error("--approx-epsilon must be positive.")
 
-    # Determine output path
+    # Output path
     if args.output is None:
         stem = os.path.splitext(os.path.basename(args.image))[0]
         args.output = stem + ".dxf"
-
-    # Warn if output already exists
     if os.path.exists(args.output):
-        print(f"Warning: output file '{args.output}' already exists and will be overwritten.",
+        print(f"Warning: '{args.output}' already exists and will be overwritten.",
               file=sys.stderr)
 
-    # ── Preprocessing ────────────────────────────────────────────────────────
+    # ── 1. Preprocess ──────────────────────────────────────────────────────────
     try:
         original_bgr, binary = load_and_preprocess(
             args.image,
             threshold_method=args.threshold_method,
             invert=args.invert,
             manual_threshold=args.threshold,
+            morph=args.morph,
+            morph_kernel=args.morph_kernel,
+            adaptive_block_size=args.adaptive_block_size,
+            adaptive_c=args.adaptive_c,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    image_height, image_width = binary.shape[:2]
-
+    h, w = binary.shape[:2]
     if args.verbose:
-        print(f"Image loaded: {image_width}x{image_height} px  ({args.image})")
+        print(f"Image: {w}x{h} px  ({args.image})")
 
-    # ── Vectorisation ─────────────────────────────────────────────────────────
+    # ── 2. Text / graphics separation ─────────────────────────────────────────
+    text_contours: list = []
+    graphics_binary = binary
+
+    if not args.no_text_separation:
+        text_mask, graphics_binary = separate_text_and_graphics(binary)
+        # Extract contour outlines from the text mask for DXF export
+        raw_tc, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
+        for c in raw_tc:
+            sq = c.squeeze()
+            if sq.ndim == 2 and len(sq) >= 2:
+                text_contours.append(sq)
+        if args.verbose:
+            print(f"Text candidates: {len(text_contours)} blobs")
+
+    # ── 3. Vectorise ───────────────────────────────────────────────────────────
     lines, contours = extract_lines_and_contours(
-        binary,
+        graphics_binary,
         min_line_length=args.min_line_length,
         max_gap=args.max_gap,
+        hough_threshold=args.hough_threshold,
+        canny_low=args.canny_low,
+        canny_high=args.canny_high,
+        approx_epsilon=args.approx_epsilon,
+        mode=args.mode,
+        merge_lines=not args.no_merge_lines,
     )
 
     if args.verbose:
-        print(f"Detected {len(lines)} Hough line segment(s) and {len(contours)} contour(s).")
+        print(f"Lines: {len(lines)}  Contours: {len(contours)}")
 
-    # ── DXF export ────────────────────────────────────────────────────────────
+    # ── 4. Export DXF ──────────────────────────────────────────────────────────
     entity_count = export_to_dxf(
-        lines,
-        contours,
-        args.output,
-        image_height=image_height,
+        lines, contours, args.output,
+        image_height=h,
         dpi=args.dpi,
         units_mm=True,
+        text_mask_contours=text_contours,
     )
 
-    if entity_count == 0:
+    total = entity_count
+    if total == 0:
         print(
-            "Warning: no entities were written to the DXF.\n"
-            "  Try one or more of:\n"
-            "    --invert              (if drawing is white-on-black)\n"
-            "    --threshold-method adaptive\n"
-            "    --min-line-length 20  (detect shorter lines)\n"
-            "    --threshold 128       (manual binarisation)\n",
+            "Warning: no entities written to the DXF.\n"
+            "  Try: --invert | --threshold-method adaptive | "
+            "--min-line-length 20 | --threshold 128",
             file=sys.stderr,
         )
     else:
-        print(f"Saved {entity_count} entit{'y' if entity_count == 1 else 'ies'} to '{args.output}'.")
+        print(f"Saved {total} entit{'y' if total == 1 else 'ies'} → '{args.output}'")
 
-    # ── Optional preview ──────────────────────────────────────────────────────
+    # ── 5. Preview ─────────────────────────────────────────────────────────────
     if args.preview:
-        if args.output_preview:
-            preview_path = args.output_preview
-        else:
-            stem = os.path.splitext(os.path.basename(args.image))[0]
-            preview_path = stem + "_preview.png"
-        save_preview(original_bgr, lines, contours, preview_path)
+        preview_path = args.output_preview or (
+            os.path.splitext(os.path.basename(args.image))[0] + "_preview.png"
+        )
+        save_preview(original_bgr, lines, contours, text_contours, preview_path)
         if args.verbose:
-            print(f"Preview saved to '{preview_path}'.")
+            print(f"Preview → '{preview_path}'")
 
     return 0
 

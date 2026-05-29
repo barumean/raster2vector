@@ -3,6 +3,14 @@ import os
 import ezdxf
 import numpy as np
 
+# DXF layer definitions: (name, ACI colour)
+_LAYERS = [
+    ("LINES",            7),   # white/black — Hough straight segments
+    ("CONTOURS",         3),   # green       — curved / complex polylines
+    ("TEXT_CANDIDATES",  2),   # yellow      — blobs classified as text
+    ("NOISE_REJECTED",   8),   # dark grey   — entities below noise threshold
+]
+
 
 def export_to_dxf(
     lines: list,
@@ -11,27 +19,36 @@ def export_to_dxf(
     image_height: int,
     dpi: float = 96.0,
     units_mm: bool = True,
+    text_mask_contours: list | None = None,
 ) -> int:
-    """Export detected lines and contours to a DXF file.
+    """Export detected geometry to a DXF file.
 
-    Coordinate conversion: pixel -> mm (or inches when units_mm=False).
-    DXF Y-axis is flipped relative to image pixel Y:
-        dxf_y = (image_height - pixel_y) * scale
+    Coordinate mapping
+    ------------------
+    pixel (x, y)  →  DXF (x * scale,  (image_height - y) * scale)
+    where scale = 25.4 / dpi  (mm/px)  when units_mm is True,
+          scale = 1.0  / dpi  (in/px)  otherwise.
+
+    Entity rules
+    ------------
+    * Straight segments from Hough → LINE on layer LINES.
+    * Curved polylines             → LWPOLYLINE (closed when start≈end) on CONTOURS.
+    * Text candidates              → LWPOLYLINE on TEXT_CANDIDATES.
 
     Args:
-        lines: List of (x1, y1, x2, y2) tuples in pixel space.
-        contours: List of np.ndarray of shape (N, 2) in pixel space.
+        lines: List of (x1, y1, x2, y2) pixel tuples.
+        contours: List of np.ndarray (N, 2) pixel arrays.
         output_path: Destination .dxf file path.
-        image_height: Height of the source image in pixels.
-        dpi: Dots per inch of the source image (used for unit conversion).
-        units_mm: When True produce millimetre coordinates; otherwise inches.
+        image_height: Source image height in pixels (for Y-flip).
+        dpi: Source image resolution used for pixel→unit conversion.
+        units_mm: Produce millimetre coordinates when True, inches otherwise.
+        text_mask_contours: Optional contours from the text-candidate mask.
 
     Returns:
         Total number of DXF entities written.
     """
-    pixel_to_unit = 25.4 / dpi if units_mm else 1.0 / dpi
+    scale = 25.4 / dpi if units_mm else 1.0 / dpi
 
-    # Create parent directories if they don't exist
     parent = os.path.dirname(output_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -41,29 +58,36 @@ def export_to_dxf(
 
     msp = doc.modelspace()
 
-    # Create named layers
-    doc.layers.add("lines", color=7)     # white / black depending on background
-    doc.layers.add("contours", color=3)  # green
+    for name, colour in _LAYERS:
+        doc.layers.add(name, color=colour)
 
-    def px_to_dxf(x: float, y: float) -> tuple[float, float]:
-        return x * pixel_to_unit, (image_height - y) * pixel_to_unit
+    def px(x: float, y: float) -> tuple[float, float]:
+        return x * scale, (image_height - y) * scale
 
     entity_count = 0
 
-    # Add LINE entities for Hough-detected straight segments
+    # ── Straight lines ────────────────────────────────────────────────────────
     for x1, y1, x2, y2 in lines:
-        dx1, dy1 = px_to_dxf(x1, y1)
-        dx2, dy2 = px_to_dxf(x2, y2)
-        msp.add_line((dx1, dy1), (dx2, dy2), dxfattribs={"layer": "lines"})
+        msp.add_line(px(x1, y1), px(x2, y2), dxfattribs={"layer": "LINES"})
         entity_count += 1
 
-    # Add LWPOLYLINE entities for remaining contour shapes
+    # ── Curved / complex polylines ────────────────────────────────────────────
     for contour in contours:
-        dxf_points = [px_to_dxf(float(pt[0]), float(pt[1])) for pt in contour]
-        first, last = contour[0], contour[-1]
-        is_closed = bool(np.linalg.norm(first.astype(float) - last.astype(float)) < 2.0)
-        msp.add_lwpolyline(dxf_points, close=is_closed, dxfattribs={"layer": "contours"})
+        pts = [px(float(p[0]), float(p[1])) for p in contour]
+        first, last = contour[0].astype(float), contour[-1].astype(float)
+        closed = bool(np.linalg.norm(first - last) < 2.0)
+        msp.add_lwpolyline(pts, close=closed, dxfattribs={"layer": "CONTOURS"})
         entity_count += 1
+
+    # ── Text candidates ───────────────────────────────────────────────────────
+    for tc in (text_mask_contours or []):
+        pts = [px(float(p[0]), float(p[1])) for p in tc]
+        if len(pts) >= 2:
+            first, last = tc[0].astype(float), tc[-1].astype(float)
+            closed = bool(np.linalg.norm(first - last) < 2.0)
+            msp.add_lwpolyline(pts, close=closed,
+                               dxfattribs={"layer": "TEXT_CANDIDATES"})
+            entity_count += 1
 
     doc.saveas(output_path)
     return entity_count
