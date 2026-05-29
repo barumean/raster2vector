@@ -52,6 +52,8 @@ def export_to_dxf(
     units_mm: bool = True,
     text_mask_contours: list | None = None,
     arcs: list | None = None,
+    line_weights: list | None = None,
+    contour_weights: list | None = None,
 ) -> int:
     """Export detected geometry to a DXF file.
 
@@ -99,16 +101,22 @@ def export_to_dxf(
     entity_count = 0
 
     # ── Straight lines ────────────────────────────────────────────────────────
-    for x1, y1, x2, y2 in lines:
-        msp.add_line(px(x1, y1), px(x2, y2), dxfattribs={"layer": "LINES"})
+    for i, (x1, y1, x2, y2) in enumerate(lines):
+        attribs: dict = {"layer": "LINES"}
+        if line_weights and i < len(line_weights) and line_weights[i] > 0:
+            attribs["lineweight"] = line_weights[i]
+        msp.add_line(px(x1, y1), px(x2, y2), dxfattribs=attribs)
         entity_count += 1
 
     # ── Curved / complex polylines ────────────────────────────────────────────
-    for contour in contours:
+    for i, contour in enumerate(contours):
         pts = [px(float(p[0]), float(p[1])) for p in contour]
         first, last = contour[0].astype(float), contour[-1].astype(float)
         closed = bool(np.linalg.norm(first - last) < 2.0)
-        msp.add_lwpolyline(pts, close=closed, dxfattribs={"layer": "CONTOURS"})
+        attribs = {"layer": "CONTOURS"}
+        if contour_weights and i < len(contour_weights) and contour_weights[i] > 0:
+            attribs["lineweight"] = contour_weights[i]
+        msp.add_lwpolyline(pts, close=closed, dxfattribs=attribs)
         entity_count += 1
 
     # ── Circles / arcs (compact CAD primitives, DXF Section 5) ────────────────

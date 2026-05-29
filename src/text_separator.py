@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -77,40 +78,67 @@ def _hough_collinear_groups(
 def separate_text_and_graphics(
     binary: np.ndarray,
     min_char_area: int = 10,
-    max_char_area: int = 2000,
+    max_char_area: Optional[int] = None,
+    size_threshold_n: float = 3.0,
     min_aspect: float = 0.1,
     max_aspect: float = 10.0,
     min_string_count: int = 3,
     search_radius_factor: float = 3.0,
     angle_step_deg: float = 3.0,
-    rho_tol_factor: float = 0.5,
+    rho_tol_factor: float = 0.2,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Separate text blobs from graphics using connected-component analysis.
 
-    Implements a Fletcher-Kasturi-style heuristic:
+    Implements the Fletcher-Kasturi algorithm:
     1. Extract connected components.
-    2. Filter by bounding-box area and aspect ratio to find character candidates.
-    3. Group candidates whose centroids are *collinear* (lie on a shared text
-       baseline) using a Hough transform on the centroids, with a consecutive
-       spacing constraint so unrelated alignments are not merged.
-    4. Any collinear run of >= min_string_count characters is treated as text.
+    2. Filter by bounding-box area and aspect ratio.  The upper area threshold
+       follows the FK formula: T1 = size_threshold_n × max(A_mode, A_mean),
+       where A_mode is the most-frequent component area and A_mean is the mean.
+       This is dynamic rather than a fixed pixel count so it adapts to
+       different drawing scales and DPI values.
+    3. Group candidates whose centroids are *collinear* using a Hough transform
+       on the centroids.  ρ resolution is R = rho_tol_factor × H_avg following
+       the FK recommendation R ≈ 0.2 × H_avg.
+    4. Any collinear run of >= min_string_count characters is labelled as text.
 
     Args:
         binary: Binary image (white foreground on black background), uint8.
         min_char_area: Minimum CC area to consider as a character.
-        max_char_area: Maximum CC area to consider as a character (larger = graphics).
-        min_aspect: Minimum bounding-box aspect ratio (w/h) for character candidates.
-        max_aspect: Maximum bounding-box aspect ratio (w/h) for character candidates.
-        min_string_count: Minimum characters in a collinear run to label as text.
-        search_radius_factor: Multiplier on median char height for the maximum
-            inter-character spacing along a baseline.
+        max_char_area: Hard upper area cap.  None = use dynamic T1 only.
+        size_threshold_n: Multiplier n in T1 = n × max(A_mode, A_mean). (FK)
+        min_aspect: Minimum bounding-box aspect ratio (w/h) for characters.
+        max_aspect: Maximum bounding-box aspect ratio (w/h) for characters.
+        min_string_count: Minimum characters in a run to label as text.
+        search_radius_factor: Max inter-character gap along the baseline
+            (as a multiple of median char height).
         angle_step_deg: Angular resolution of the Hough sweep (degrees).
-        rho_tol_factor: ρ bin width as a fraction of median char height.
+        rho_tol_factor: ρ bin width as a fraction of H_avg (FK: 0.2).
 
     Returns:
         (text_mask, graphics_mask) — both uint8 binary images.
     """
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    # Collect all foreground-component areas for dynamic T1 calculation (FK §1)
+    all_areas = []
+    for i in range(1, n_labels):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        if a > 0:
+            all_areas.append(a)
+
+    if all_areas:
+        a_mean = float(np.mean(all_areas))
+        # mode approximated by the most-common value in a histogram
+        counts, edges = np.histogram(all_areas, bins=min(50, max(1, len(all_areas))))
+        a_mode = float(edges[int(np.argmax(counts))])
+        t1_dynamic = size_threshold_n * max(a_mode, a_mean)
+    else:
+        t1_dynamic = float(max_char_area or 2000)
+
+    effective_max_area = min(
+        max_char_area if max_char_area is not None else int(t1_dynamic),
+        int(t1_dynamic),
+    )
 
     char_indices = []
     char_centres = []  # (cx, cy)
@@ -125,7 +153,7 @@ def separate_text_and_graphics(
         if w == 0 or h == 0:
             continue
         aspect = w / h
-        if (min_char_area <= area <= max_char_area
+        if (min_char_area <= area <= effective_max_area
                 and min_aspect <= aspect <= max_aspect):
             char_indices.append(i)
             char_centres.append((x + w / 2.0, y + h / 2.0))
