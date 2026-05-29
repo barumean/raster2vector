@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -51,8 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
-    vec.add_argument("--mode", choices=["edge", "skeleton"], default="skeleton",
-                     help="skeleton (default): 1-px centre-line; edge: Canny-based")
+    vec.add_argument("--mode", choices=["edge", "skeleton"], default="edge",
+                     help="edge (default): Canny on grayscale → captures subtle "
+                          "colour boundaries; skeleton: morphological centre-line")
     vec.add_argument("--pre-close-kernel", type=int, default=0, metavar="N",
                      help="Kernel size for closing before skeletonise (fills thick "
                           "stroke interior so a thick line → single centre-line). "
@@ -147,7 +149,7 @@ def main(argv=None) -> int:
 
     # ── 1. Preprocess ──────────────────────────────────────────────────────────
     try:
-        original_bgr, binary = load_and_preprocess(
+        original_bgr, gray, binary = load_and_preprocess(
             args.image,
             threshold_method=args.threshold_method,
             invert=args.invert,
@@ -172,12 +174,11 @@ def main(argv=None) -> int:
 
     # ── 2. Text / graphics separation ─────────────────────────────────────────
     text_contours: list = []
-    graphics_binary = binary
+    text_mask_img: Optional[np.ndarray] = None
 
     if args.text_separation:
-        text_mask, graphics_binary = separate_text_and_graphics(binary)
-        # Extract contour outlines from the text mask for DXF export
-        raw_tc, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL,
+        text_mask_img, _ = separate_text_and_graphics(binary)
+        raw_tc, _ = cv2.findContours(text_mask_img, cv2.RETR_EXTERNAL,
                                      cv2.CHAIN_APPROX_SIMPLE)
         for c in raw_tc:
             sq = c.squeeze()
@@ -188,7 +189,9 @@ def main(argv=None) -> int:
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
     lines, contours = extract_lines_and_contours(
-        graphics_binary,
+        binary,
+        gray=gray,
+        text_mask=text_mask_img,
         min_line_length=args.min_line_length,
         max_gap=args.max_gap,
         hough_threshold=args.hough_threshold,

@@ -51,7 +51,11 @@ def load_and_preprocess(
         min_speckle_area: Components smaller than this (px) are dropped.
 
     Returns:
-        (original_bgr, binary_image)
+        (original_bgr, gray_image, binary_image)
+        gray_image  : 8-bit grayscale of the original (after optional invert).
+                      Used by Canny for gradient-based edge detection so that
+                      subtle colour/tone boundaries are not lost to binarisation.
+        binary_image: Normalised binary with strokes = 255 (minority foreground).
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -61,6 +65,8 @@ def load_and_preprocess(
 
     if invert:
         gray = cv2.bitwise_not(gray)
+
+    gray_out = gray.copy()   # preserve pre-threshold grayscale for Canny
 
     h, w = gray.shape[:2]
 
@@ -97,4 +103,4 @@ def load_and_preprocess(
         elif morph == "close":
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    return img, binary
+    return img, gray_out, binary

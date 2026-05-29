@@ -58,7 +58,7 @@ def dxf_out(tmp_path):
 
 def test_full_pipeline(square_image_path, dxf_out):
     """Full edge-mode pipeline produces a valid, non-empty DXF."""
-    original_bgr, binary = load_and_preprocess(square_image_path)
+    original_bgr, gray, binary = load_and_preprocess(square_image_path)
     h = binary.shape[0]
 
     lines, contours = extract_lines_and_contours(binary, min_line_length=30)
@@ -75,7 +75,7 @@ def test_full_pipeline(square_image_path, dxf_out):
 
 def test_skeleton_mode(square_image_path, dxf_out):
     """Skeleton mode also produces at least one entity."""
-    original_bgr, binary = load_and_preprocess(square_image_path)
+    original_bgr, gray, binary = load_and_preprocess(square_image_path)
     lines, contours = extract_lines_and_contours(binary, min_line_length=20,
                                                   mode="skeleton")
     count = export_to_dxf(lines, contours, dxf_out, image_height=binary.shape[0])
@@ -84,7 +84,7 @@ def test_skeleton_mode(square_image_path, dxf_out):
 
 def test_thin_line_preservation(thin_image_path, dxf_out):
     """Thin 1-px lines survive preprocessing with morph='none'."""
-    _, binary = load_and_preprocess(thin_image_path, morph="none")
+    _, _gray, binary = load_and_preprocess(thin_image_path, morph="none")
     assert np.count_nonzero(binary) > 0, "Thin lines were erased by preprocessing"
     lines, contours = extract_lines_and_contours(binary, min_line_length=20)
     assert len(lines) + len(contours) >= 1
@@ -93,7 +93,7 @@ def test_thin_line_preservation(thin_image_path, dxf_out):
 def test_morphology_options(square_image_path):
     """All morph modes run without error."""
     for morph in ("none", "open", "close"):
-        _, binary = load_and_preprocess(square_image_path, morph=morph)
+        _, _gray, binary = load_and_preprocess(square_image_path, morph=morph)
         assert binary is not None
 
 
@@ -114,7 +114,7 @@ def test_polarity_normalization_black_on_white(tmp_path):
     cv2.line(img, (10, 60), (110, 60), 0, 2)         # black line
     path = str(tmp_path / "bow.png")
     cv2.imwrite(path, img)
-    _, binary = load_and_preprocess(path)
+    _, _gray, binary = load_and_preprocess(path)
     # Foreground (the line) must be the white minority, not the page.
     assert np.count_nonzero(binary) < binary.size / 2
     assert np.count_nonzero(binary) > 0
@@ -126,7 +126,7 @@ def test_skeleton_no_page_border_black_on_white(tmp_path):
     cv2.line(img, (10, 60), (110, 60), 0, 2)
     path = str(tmp_path / "bow.png")
     cv2.imwrite(path, img)
-    _, binary = load_and_preprocess(path)
+    _, _gray, binary = load_and_preprocess(path)
     lines, contours = extract_lines_and_contours(binary, min_line_length=30,
                                                  mode="skeleton")
     # All detected geometry should sit near y≈60, never on the page edges (0/119).
@@ -173,7 +173,7 @@ def test_thick_line_single_centre_line(tmp_path):
     cv2.line(img, (10, 60), (290, 60), 255, 10)   # thick white line
     path = str(tmp_path / "thick.png")
     cv2.imwrite(path, img)
-    _, binary = load_and_preprocess(path)
+    _, _gray, binary = load_and_preprocess(path)
     lines, contours = extract_lines_and_contours(
         binary, min_line_length=30, mode="skeleton",
     )
@@ -190,7 +190,7 @@ def test_pre_close_thick_line(tmp_path):
     cv2.rectangle(img, (10, 50), (290, 70), 255, -1)  # filled rectangle (thick line)
     path = str(tmp_path / "rect.png")
     cv2.imwrite(path, img)
-    _, binary = load_and_preprocess(path)
+    _, _gray, binary = load_and_preprocess(path)
     lines_no_close, _ = extract_lines_and_contours(binary, min_line_length=30,
                                                     mode="skeleton", pre_close_kernel=0)
     lines_close, _ = extract_lines_and_contours(binary, min_line_length=30,
@@ -206,7 +206,7 @@ def test_adaptive_block_oversized(tmp_path):
     path = str(tmp_path / "small.png")
     cv2.imwrite(path, img)
     # Should not raise cv2.error
-    _, binary = load_and_preprocess(path, threshold_method="adaptive",
+    _, _gray, binary = load_and_preprocess(path, threshold_method="adaptive",
                                     adaptive_block_size=100000001)
     assert binary is not None
 
@@ -219,7 +219,7 @@ def test_thin_grid_survives_default(tmp_path):
         cv2.line(img, (i, 0), (i, 99), 255, 1)
     path = str(tmp_path / "grid.png")
     cv2.imwrite(path, img)
-    _, binary = load_and_preprocess(path)  # defaults: morph=none, despeckle=True
+    _, _gray, binary = load_and_preprocess(path)  # defaults: morph=none, despeckle=True
     assert np.count_nonzero(binary) > 0, "thin grid erased by default preprocessing"
 
 
@@ -250,7 +250,7 @@ def test_dpi_validation():
 
 def test_approx_epsilon_option(square_image_path, dxf_out):
     """Custom --approx-epsilon produces a valid DXF."""
-    _, binary = load_and_preprocess(square_image_path)
+    _, _gray, binary = load_and_preprocess(square_image_path)
     lines, contours = extract_lines_and_contours(binary, approx_epsilon=3.0)
     count = export_to_dxf(lines, contours, dxf_out, image_height=binary.shape[0])
     assert count >= 0  # may be 0 for a simple image — just must not crash
@@ -258,7 +258,7 @@ def test_approx_epsilon_option(square_image_path, dxf_out):
 
 def test_layer_names(square_image_path, dxf_out):
     """DXF output contains the expected layer names."""
-    _, binary = load_and_preprocess(square_image_path)
+    _, _gray, binary = load_and_preprocess(square_image_path)
     lines, contours = extract_lines_and_contours(binary, min_line_length=30)
     export_to_dxf(lines, contours, dxf_out, image_height=binary.shape[0])
     doc = ezdxf.readfile(dxf_out)

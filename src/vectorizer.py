@@ -1,3 +1,5 @@
+from typing import Optional
+
 import cv2
 import numpy as np
 
@@ -203,45 +205,54 @@ def _snap_endpoints(lines: list, radius: float = 4.0) -> list:
 
 def extract_lines_and_contours(
     binary: np.ndarray,
+    gray: Optional[np.ndarray] = None,
+    text_mask: Optional[np.ndarray] = None,
     min_line_length: int = 30,
     max_gap: int = 20,
     hough_threshold: int = 30,
     canny_low: int = 50,
     canny_high: int = 150,
     approx_epsilon: float = 1.5,
-    mode: str = "skeleton",
+    mode: str = "edge",
     merge_lines: bool = True,
     snap_radius: float = 4.0,
     pre_close_kernel: int = 0,
 ) -> tuple[list, list]:
-    """Extract straight lines and contour polylines from a binary image.
+    """Extract straight lines and contour polylines from an image.
 
     Pipeline
     --------
-    1. Optional pre-close: dilate+erode to fill gaps in thick strokes so that
-       a solid thick line skeletonises to a single centre-line (not two edges).
-    2. Source image: skeleton (1-px centre-lines) or Canny edges.
+    1. Build a 1-px edge/skeleton source image:
+       - edge mode : Canny on *grayscale* (if provided) so that subtle
+                     colour/tone boundaries are not lost to binarisation.
+                     Canny output is thinned to 1 px before Hough so that
+                     thick lines don't produce two parallel edge responses.
+       - skeleton  : Morphological thinning of the binary → 1-px centre-lines.
+    2. Mask out text regions (if text_mask provided) to suppress false lines
+       through letter strokes.
     3. HoughLinesP on the 1-px source → straight-line segments.
     4. Merge collinear fragments → longer lines.
     5. Snap near-touching endpoints → clean topology.
     6. findContours on remaining pixels → curved / complex polylines.
 
-    The input binary must have foreground (strokes) = 255, as produced by
-    load_and_preprocess (which normalises polarity automatically).
-
     Args:
-        binary: White-foreground binary image, uint8.
+        binary      : White-foreground binary image, uint8 (strokes = 255).
+        gray        : Optional 8-bit grayscale of the original image.
+                      When provided and mode='edge', Canny runs on this
+                      instead of the binary — captures subtle colour/tone
+                      boundaries that binarisation would erase.
+        text_mask   : Optional binary mask (255 = text region).  Those
+                      pixels are blanked from the edge map before Hough so
+                      that lines are not drawn through letter strokes.
         min_line_length: Minimum Hough segment length (pixels).
-        max_gap: Max gap (pixels) bridged inside a single Hough segment.
+        max_gap     : Max gap (pixels) bridged inside a single Hough segment.
         hough_threshold: Accumulator threshold for HoughLinesP.
-        canny_low / canny_high: Hysteresis thresholds (edge mode only).
+        canny_low / canny_high: Canny hysteresis thresholds.
         approx_epsilon: Douglas-Peucker tolerance for polyline vertices.
-        mode: 'skeleton' (default, drawing-optimised) or 'edge' (Canny).
-        merge_lines: Merge collinear adjacent fragments.
-        snap_radius: Max distance (px) between endpoints that get snapped.
-        pre_close_kernel: If > 0, apply a closing of this kernel size before
-            skeletonising; helps join the two Canny edges of a thick stroke
-            into a solid filled region that skeletonises to one centre-line.
+        mode        : 'edge' (default) or 'skeleton'.
+        merge_lines : Merge collinear adjacent fragments.
+        snap_radius : Max distance (px) to snap near-touching endpoints.
+        pre_close_kernel: Closing kernel size before skeletonising (0 = off).
 
     Returns:
         (hough_lines, contours)
@@ -250,20 +261,27 @@ def extract_lines_and_contours(
     """
     work = binary.copy()
 
-    # Step 1: Pre-close — fill interior of thick strokes so skeleton
-    # produces ONE centre-line instead of two edge-lines.
-    if pre_close_kernel > 0:
+    # Optional pre-close for skeleton mode (fills thick stroke interiors).
+    if pre_close_kernel > 0 and mode == "skeleton":
         k = np.ones((pre_close_kernel, pre_close_kernel), np.uint8)
         work = cv2.morphologyEx(work, cv2.MORPH_CLOSE, k, iterations=1)
 
-    # Step 2: Build 1-px source image.
+    # Step 1: Build 1-px source image.
     if mode == "skeleton":
         source = _skeletonize(work)
     else:
-        # edge mode: also thin the Canny output so thick strokes don't
-        # produce double edges entering Hough.
-        edges = cv2.Canny(work, canny_low, canny_high, apertureSize=3)
-        source = _skeletonize(edges)  # thin even Canny output
+        # Run Canny on the *original grayscale* when available so that
+        # subtle brightness / colour boundaries are detected even when
+        # binarisation merges them.  Fall back to the binary image.
+        canny_input = gray if gray is not None else work
+        edges = cv2.Canny(canny_input, canny_low, canny_high, apertureSize=3)
+        # Thin: collapse the two edges of a thick stroke into one centre-line.
+        source = _skeletonize(edges)
+
+    # Step 2: Suppress text regions so lines are not drawn through letters.
+    if text_mask is not None:
+        dilated_text = cv2.dilate(text_mask, np.ones((5, 5), np.uint8), iterations=1)
+        source = cv2.bitwise_and(source, cv2.bitwise_not(dilated_text))
 
     # Step 3: Hough line detection.
     hough_result = cv2.HoughLinesP(
