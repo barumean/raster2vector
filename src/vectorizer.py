@@ -121,6 +121,53 @@ def _simplify(contour_cv2: np.ndarray, epsilon: float) -> np.ndarray:
     return sq.astype(np.int32)
 
 
+# ── Weak structural cleanup ──────────────────────────────────────────────────
+
+def _remove_near_collinear_vertices(pts: np.ndarray, tolerance: float) -> np.ndarray:
+    """Remove small zig-zag vertices while preserving the segment's angle.
+
+    This is intentionally not an orthogonal snap.  A 7 degree diagonal remains
+    a 7 degree diagonal; only points that sit close to the chord between their
+    neighbours are removed.
+    """
+    if len(pts) <= 2 or tolerance <= 0:
+        return pts
+
+    cleaned = [pts[0]]
+    for idx in range(1, len(pts) - 1):
+        p = pts[idx]
+        prev = cleaned[-1].astype(float)
+        nxt = pts[idx + 1].astype(float)
+        if _perp_dist(p.astype(float), prev, nxt) > tolerance:
+            cleaned.append(p)
+    cleaned.append(pts[-1])
+    return np.array(cleaned, dtype=np.int32)
+
+
+def _structure_cleanup_polyline(
+    contour_cv2: np.ndarray,
+    pts: np.ndarray,
+    closed: bool,
+    line_tolerance: float,
+    quad_detection: bool,
+) -> np.ndarray:
+    """Clean structure-like contour geometry without forcing right angles.
+
+    * Open/complex polylines: remove tiny near-collinear wiggles.
+    * Closed four-sided shapes: return a clean quadrilateral, preserving its
+      actual corner angles (rectangles, trapezoids, parallelograms, diagonals).
+    """
+    if line_tolerance <= 0 or len(pts) < 3:
+        return pts
+
+    if closed and quad_detection:
+        quad = cv2.approxPolyDP(contour_cv2, line_tolerance, closed=True).squeeze()
+        if quad.ndim == 2 and len(quad) == 4 and abs(cv2.contourArea(quad)) > 1.0:
+            return np.vstack([quad, quad[0]]).astype(np.int32)
+
+    return _remove_near_collinear_vertices(pts, line_tolerance)
+
+
 # ── Circle / arc fitting (DXF Section 5: native ARC/CIRCLE + bulge) ────────────
 
 def _fit_circle(pts: np.ndarray) -> tuple[float, float, float, float]:
@@ -357,6 +404,9 @@ def extract_lines_and_contours(
     merge_lines: bool = True,
     snap_radius: float = 4.0,
     pre_close_kernel: int = 0,
+    structure_cleanup: bool = False,
+    structure_line_tolerance: float = 2.5,
+    quad_detection: bool = True,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
@@ -387,6 +437,12 @@ def extract_lines_and_contours(
         merge_lines  : Merge collinear Hough fragments.
         snap_radius  : Endpoint snap distance (px).  0 = disabled.
         pre_close_kernel: Closing before edge detection (0 = off).
+        structure_cleanup: Weak structural cleanup for drawings dominated by
+                       straight structure edges.  Preserves diagonal angles.
+        structure_line_tolerance: Pixel tolerance used to remove small
+                       near-collinear wiggles and detect clean quadrilaterals.
+        quad_detection: When structure cleanup is enabled, simplify closed
+                       four-sided contours to clean quadrilaterals.
 
         detect_arcs  : Try to model curved contours as circles/arcs.
         arc_tol      : Max RMS pixel residual for a circle fit.  None = auto
@@ -452,6 +508,12 @@ def extract_lines_and_contours(
             continue
 
         closed = _is_closed(c, tol_px=max(4.0, eps * 2))
+        if structure_cleanup:
+            pts = _structure_cleanup_polyline(
+                c, pts, closed, structure_line_tolerance, quad_detection
+            )
+            if len(pts) < 2:
+                continue
 
         if _is_straight(pts, max_line_deviation):
             # Entire simplified contour is straight → LINE entity
