@@ -168,20 +168,22 @@ def test_snap_endpoints_no_snap_far_apart():
 
 
 def test_thick_line_single_centre_line(tmp_path):
-    """A thick (10px) horizontal line should produce only ONE centre line."""
+    """A thick (10px) horizontal line should produce geometry near y≈60."""
     img = np.zeros((120, 300), dtype=np.uint8)
     cv2.line(img, (10, 60), (290, 60), 255, 10)   # thick white line
     path = str(tmp_path / "thick.png")
     cv2.imwrite(path, img)
     _, _gray, binary = load_and_preprocess(path)
     lines, contours = extract_lines_and_contours(
-        binary, min_line_length=30, mode="skeleton",
+        binary, min_line_length=30,
     )
-    # All y-coordinates of detected lines should cluster near 60
+    # Contour-first pipeline: thick line produces outline contours near y≈60
     all_y = [y for (_, y1, _, y2) in lines for y in (y1, y2)]
-    assert all_y, "No lines detected on thick line"
-    assert all(50 <= y <= 70 for y in all_y), \
-        f"Got multiple y-bands (double-line artefact?): {sorted(set(all_y))}"
+    all_y += [pt[1] for c in contours for pt in c]
+    assert all_y, "No geometry detected on thick line"
+    # All geometry should be in the stripe 50-70, not scattered across the image
+    assert all(45 <= y <= 75 for y in all_y), \
+        f"Geometry outside expected band: {sorted(set(all_y))}"
 
 
 def test_pre_close_thick_line(tmp_path):

@@ -53,17 +53,24 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
     vec.add_argument("--mode", choices=["edge", "skeleton"], default="edge",
-                     help="edge (default): Canny on grayscale → captures subtle "
-                          "colour boundaries; skeleton: morphological centre-line")
+                     help="edge (default): contour-first + Canny on grayscale; "
+                          "skeleton: deprecated, treated as edge")
     vec.add_argument("--pre-close-kernel", type=int, default=0, metavar="N",
-                     help="Kernel size for closing before skeletonise (fills thick "
-                          "stroke interior so a thick line → single centre-line). "
-                          "0=off. Try 5-15 for thick-line drawings.")
-    vec.add_argument("--min-line-length", type=int, default=30, metavar="PX",
-                     help="Minimum Hough line segment length")
-    vec.add_argument("--max-gap", type=int, default=20, metavar="PX",
-                     help="Maximum gap bridged inside a Hough segment (px); "
-                          "raise to connect broken lines")
+                     help="Morphological closing before edge detection to fill thick "
+                          "stroke interiors. 0=off. Try 5-15 for thick drawings.")
+    vec.add_argument("--min-contour-length", type=float, default=15.0, metavar="F",
+                     help="Minimum contour arc length in pixels (shorter discarded)")
+    vec.add_argument("--min-contour-area", type=float, default=10.0, metavar="F",
+                     help="Minimum contour bounding-box area in pixels (smaller discarded)")
+    vec.add_argument("--max-line-deviation", type=float, default=2.0, metavar="F",
+                     help="Max perpendicular deviation (px) to classify a simplified "
+                          "contour as a straight LINE vs. LWPOLYLINE")
+    vec.add_argument("--no-hough", action="store_true",
+                     help="Disable supplemental Hough line detection")
+    vec.add_argument("--min-line-length", type=int, default=80, metavar="PX",
+                     help="Minimum Hough line segment length (supplemental only)")
+    vec.add_argument("--max-gap", type=int, default=15, metavar="PX",
+                     help="Maximum gap bridged inside a Hough segment (px)")
     vec.add_argument("--hough-threshold", type=int, default=30, metavar="N",
                      help="Accumulator threshold for HoughLinesP (lower = more lines)")
     vec.add_argument("--canny-low", type=int, default=50, metavar="N",
@@ -192,12 +199,16 @@ def main(argv=None) -> int:
         binary,
         gray=gray,
         text_mask=text_mask_img,
+        min_contour_length=args.min_contour_length,
+        min_contour_area=args.min_contour_area,
+        max_line_deviation=args.max_line_deviation,
+        approx_epsilon=args.approx_epsilon,
+        use_hough=not args.no_hough,
         min_line_length=args.min_line_length,
         max_gap=args.max_gap,
         hough_threshold=args.hough_threshold,
         canny_low=args.canny_low,
         canny_high=args.canny_high,
-        approx_epsilon=args.approx_epsilon,
         mode=args.mode,
         merge_lines=not args.no_merge_lines,
         snap_radius=args.snap_radius,
