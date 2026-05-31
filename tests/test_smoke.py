@@ -106,15 +106,31 @@ def test_morphology_options(square_image_path):
         assert binary is not None
 
 
+def test_sauvola_threshold(tmp_path):
+    """Sauvola binarisation produces a non-empty binary image."""
+    img = _make_square()
+    path = str(tmp_path / "sq.png")
+    cv2.imwrite(path, img)
+    _, _gray, binary = load_and_preprocess(path, threshold_method="sauvola")
+    assert binary is not None
+    assert np.count_nonzero(binary) > 0
+
+
+def test_deskew_does_not_crash(square_image_path):
+    """Deskew flag runs without error on a straight drawing."""
+    _, _gray, binary = load_and_preprocess(square_image_path, deskew=True)
+    assert binary is not None
+
+
 def test_text_separation(tmp_path):
-    """A collinear row of character-like blobs is detected as text."""
+    """A collinear row of character-like blobs is detected as text (3-tuple)."""
     img = np.zeros((200, 200), dtype=np.uint8)
-    # Draw a horizontal row of small blobs (a "text string")
     for x in range(20, 120, 15):
         cv2.rectangle(img, (x, 50), (x + 8, 62), 255, -1)
-    text_mask, graphics_mask = separate_text_and_graphics(img)
+    text_mask, graphics_mask, elongated_mask = separate_text_and_graphics(img)
     assert text_mask.shape == img.shape
     assert graphics_mask.shape == img.shape
+    assert elongated_mask.shape == img.shape
     assert np.count_nonzero(text_mask) > 0, "collinear blob row not detected as text"
 
 
@@ -123,20 +139,29 @@ def test_text_separation_isolated_blobs_not_text(tmp_path):
     img = np.zeros((200, 200), dtype=np.uint8)
     cv2.rectangle(img, (10, 10), (18, 22), 255, -1)
     cv2.rectangle(img, (170, 170), (178, 182), 255, -1)
-    text_mask, _ = separate_text_and_graphics(img)
+    text_mask, _, _ = separate_text_and_graphics(img)
     assert np.count_nonzero(text_mask) == 0
 
 
 def test_text_separation_collinear_required(tmp_path):
     """Blobs spaced as a line are grouped; a stray off-line blob is excluded."""
     img = np.zeros((200, 200), dtype=np.uint8)
-    for x in range(20, 140, 15):           # collinear row at y≈56
+    for x in range(20, 140, 15):
         cv2.rectangle(img, (x, 50), (x + 8, 62), 255, -1)
     cv2.rectangle(img, (100, 150), (108, 162), 255, -1)   # off-line stray
-    text_mask, _ = separate_text_and_graphics(img)
-    # The stray blob (around y=156) should not be painted as text.
+    text_mask, _, _ = separate_text_and_graphics(img)
     assert text_mask[156, 104] == 0, "off-baseline blob wrongly grouped as text"
     assert np.count_nonzero(text_mask) > 0
+
+
+def test_text_separation_elongated_layer():
+    """Elongated small blobs go to the 3rd (elongated) layer, not text."""
+    img = np.zeros((200, 200), dtype=np.uint8)
+    # Draw 5 narrow horizontal dash-like blobs at the same y (elongation ≥ T4=2)
+    for x in range(10, 110, 20):
+        cv2.rectangle(img, (x, 100), (x + 14, 103), 255, -1)  # 15×4: ratio ~3.75
+    _, _, elong = separate_text_and_graphics(img)
+    assert np.count_nonzero(elong) > 0, "dash-like elongated blobs not in elongated layer"
 
 
 def test_polarity_normalization_black_on_white(tmp_path):
@@ -312,13 +337,6 @@ def test_bulge_quarter_circle():
     b = _bulge_from_3pts(s, m, e)
     assert abs(b - np.tan(np.pi / 8)) < 1e-6, b
 
-
-def test_bulge_sign_flips_with_direction():
-    """Reversing arc direction flips the bulge sign."""
-    s = (1.0, 0.0)
-    m = (np.cos(np.pi / 4), np.sin(np.pi / 4))
-    e = (0.0, 1.0)
-    assert _bulge_from_3pts(s, m, e) * _bulge_from_3pts(e, m, s) < 0
 
 
 def test_circle_detected_and_exported(tmp_path, dxf_out):

@@ -31,9 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
     pre = p.add_argument_group("preprocessing")
-    pre.add_argument("--threshold-method", choices=["otsu", "adaptive"],
+    pre.add_argument("--threshold-method", choices=["otsu", "adaptive", "sauvola"],
                      default="otsu", metavar="METHOD",
-                     help="Binarisation method: otsu or adaptive")
+                     help="Binarisation method: otsu, adaptive, or sauvola. "
+                          "sauvola (Sauvola 1999) is best for scanned drawings "
+                          "with uneven illumination or fold shadows.")
     pre.add_argument("--threshold", type=int, default=None, metavar="0-255",
                      help="Manual threshold value; overrides --threshold-method")
     pre.add_argument("--invert", action="store_true",
@@ -50,6 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Block size for adaptive thresholding (auto-clamped odd ≥ 3)")
     pre.add_argument("--adaptive-c", type=int, default=9, metavar="N",
                      help="Constant subtracted from mean in adaptive thresholding")
+    pre.add_argument("--sauvola-window", type=int, default=25, metavar="N",
+                     help="Local window size for Sauvola thresholding (≈ stroke size)")
+    pre.add_argument("--sauvola-k", type=float, default=0.2, metavar="F",
+                     help="Sauvola k parameter (0.2–0.5; lower → more foreground)")
+    pre.add_argument("--deskew", action="store_true",
+                     help="Auto-correct rotational skew before binarisation using "
+                          "the dominant angle of horizontal line blobs")
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
@@ -185,8 +194,11 @@ def main(argv=None) -> int:
             morph_kernel=args.morph_kernel,
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
+            sauvola_window_size=args.sauvola_window,
+            sauvola_k=args.sauvola_k,
             despeckle=not args.no_despeckle,
             min_speckle_area=args.min_speckle_area,
+            deskew=args.deskew,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -201,18 +213,26 @@ def main(argv=None) -> int:
 
     # ── 2. Text / graphics separation ─────────────────────────────────────────
     text_contours: list = []
+    elongated_contours: list = []
     text_mask_img: Optional[np.ndarray] = None
 
     if args.text_separation:
-        text_mask_img, _ = separate_text_and_graphics(binary)
+        text_mask_img, _, elong_mask = separate_text_and_graphics(binary)
         raw_tc, _ = cv2.findContours(text_mask_img, cv2.RETR_EXTERNAL,
                                      cv2.CHAIN_APPROX_SIMPLE)
         for c in raw_tc:
             sq = c.squeeze()
             if sq.ndim == 2 and len(sq) >= 2:
                 text_contours.append(sq)
+        raw_el, _ = cv2.findContours(elong_mask, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
+        for c in raw_el:
+            sq = c.squeeze()
+            if sq.ndim == 2 and len(sq) >= 2:
+                elongated_contours.append(sq)
         if args.verbose:
-            print(f"Text candidates: {len(text_contours)} blobs")
+            print(f"Text candidates: {len(text_contours)} blobs  "
+                  f"Elongated: {len(elongated_contours)} blobs")
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
     lines, contours, arcs = extract_lines_and_contours(
@@ -245,8 +265,14 @@ def main(argv=None) -> int:
     line_weights: Optional[list] = None
     contour_weights: Optional[list] = None
     if args.stroke_width:
-        line_weights = estimate_line_widths(binary, lines, dpi=args.dpi)
-        contour_weights = estimate_contour_widths(binary, contours, dpi=args.dpi)
+        # Build the medial_axis width map once and reuse for both lines and
+        # contours; this avoids computing it twice inside each estimate_* call.
+        from src.stroke_width import _build_width_map
+        width_map = _build_width_map(binary)
+        line_weights = estimate_line_widths(binary, lines, dpi=args.dpi,
+                                            width_map=width_map)
+        contour_weights = estimate_contour_widths(binary, contours, dpi=args.dpi,
+                                                  width_map=width_map)
         if args.verbose:
             from collections import Counter
             lw_counts = Counter(line_weights)
@@ -260,6 +286,7 @@ def main(argv=None) -> int:
             dpi=args.dpi,
             units_mm=True,
             text_mask_contours=text_contours,
+            elongated_contours=elongated_contours,
             arcs=arcs,
             line_weights=line_weights,
             contour_weights=contour_weights,
