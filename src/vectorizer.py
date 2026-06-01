@@ -374,10 +374,12 @@ def _detect_dashed_lines(
     if len(cands) < min_dash_count:
         return lines, []
 
-    # Group by angle bin
+    # Group by angle bin.  Segments near 0 and near π are the same direction
+    # (anti-parallel), so wrap the last bin back to bin 0.
+    n_bins = max(1, int(math.pi / angle_step))
     angle_bins: dict[int, list] = {}
     for i, p in cands:
-        bk = int(p['angle'] / angle_step)
+        bk = int(p['angle'] / angle_step) % n_bins
         angle_bins.setdefault(bk, []).append((i, p))
 
     dash_indices: set[int] = set()
@@ -386,17 +388,18 @@ def _detect_dashed_lines(
     for members in angle_bins.values():
         if len(members) < min_dash_count:
             continue
-        # Reference direction for this angle bin
-        ref_angle = members[0][1]['angle']
+        # Reference direction: median angle of this bin for stable projection.
+        ref_angle = float(np.median([p['angle'] for _, p in members]))
         cos_a, sin_a = math.cos(ref_angle), math.sin(ref_angle)
         # Perpendicular unit vector
         perp_x, perp_y = -sin_a, cos_a
 
-        # Sub-group by perpendicular offset (rho)
+        # Sub-group by perpendicular offset (rho).
+        # Use the bin's ref_angle for all members so rho is consistent.
         rho_clusters: dict[int, list] = {}
         for i, p in members:
             rho = p['mx'] * perp_x + p['my'] * perp_y
-            rho_bin = int(rho / perp_tol_px)
+            rho_bin = int(round(rho / perp_tol_px))
             rho_clusters.setdefault(rho_bin, []).append((i, p))
 
         for cluster in rho_clusters.values():
@@ -1170,6 +1173,8 @@ def extract_lines_and_contours(
         if detect_dashes:
             return lines, contours, arcs, dashed_lines
         return lines, contours, arcs
+    if detect_dashes:
+        return lines, contours, dashed_lines
     return lines, contours
 
 

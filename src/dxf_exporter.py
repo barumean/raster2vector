@@ -242,11 +242,22 @@ def export_to_dxf(
     for group in (dashed_lines or []):
         if len(group) < 1:
             continue
-        # Emit one LINE entity spanning the full group extent.
-        # The DASHED linetype carries the visual dash pattern.
-        first, last = group[0], group[-1]
-        x1, y1 = px(float(first[0]), float(first[1]))
-        x2, y2 = px(float(last[2]),  float(last[3]))
+        # Determine axis direction from the group's overall span.
+        all_pts = [(float(s[0]), float(s[1])) for s in group] + \
+                  [(float(s[2]), float(s[3])) for s in group]
+        xs = [p[0] for p in all_pts]
+        ys = [p[1] for p in all_pts]
+        dx = max(xs) - min(xs)
+        dy = max(ys) - min(ys)
+        # Project all endpoints onto the axis and take the two extremes.
+        if dx >= dy:
+            key = lambda pt: pt[0]
+        else:
+            key = lambda pt: pt[1]
+        start_pt = min(all_pts, key=key)
+        end_pt   = max(all_pts, key=key)
+        x1, y1 = px(start_pt[0], start_pt[1])
+        x2, y2 = px(end_pt[0],   end_pt[1])
         msp.add_line(
             (x1, y1), (x2, y2),
             dxfattribs={"layer": "DASHED", "linetype": "DASHED"},
