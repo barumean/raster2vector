@@ -4,6 +4,34 @@ import cv2
 import numpy as np
 
 
+def _selective_blur(gray: np.ndarray, radius: int, delta: int = 20) -> np.ndarray:
+    """Edge-preserving Gaussian blur (imagetracerjs selective blur, §preprocess).
+
+    Applies a Gaussian blur of the given radius, then restores the original
+    pixel value wherever the absolute difference between original and blurred
+    exceeds *delta*.  This smooths flat (low-contrast) regions — reducing
+    scanner noise and JPEG artefacts — while leaving edges sharp.
+
+    Reference: imagetracerjs selectiveblur(), blurdelta default = 20.
+
+    Args:
+        gray:   8-bit grayscale image.
+        radius: Gaussian kernel radius (ksize = 2*radius+1).  0 = no-op.
+        delta:  Intensity threshold; pixels with |original − blurred| > delta
+                are treated as edges and restored to the original value.
+    Returns:
+        Filtered grayscale image, same shape/dtype as input.
+    """
+    if radius <= 0:
+        return gray
+    ksize = 2 * radius + 1
+    blurred = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    diff = np.abs(gray.astype(np.int32) - blurred.astype(np.int32))
+    result = blurred.copy()
+    result[diff > delta] = gray[diff > delta]
+    return result
+
+
 def _despeckle(binary: np.ndarray, min_area: int) -> np.ndarray:
     """Remove isolated foreground components smaller than min_area.
 
@@ -86,6 +114,8 @@ def load_and_preprocess(
     min_speckle_area: int = 3,
     deskew: bool = False,
     deskew_min_angle: float = 0.5,
+    blur_radius: int = 0,
+    blur_delta: int = 20,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load image and produce a binary image with foreground (strokes) = 255.
 
@@ -121,6 +151,15 @@ def load_and_preprocess(
             angle of horizontal line blobs (cv2.minAreaRect on dilated contours).
         deskew_min_angle: Skew corrections smaller than this (degrees) are
             skipped to avoid unnecessary resampling.
+        blur_radius: Gaussian kernel radius for the edge-preserving selective
+            blur applied to the grayscale image before thresholding.  0 = off
+            (default).  Values 1–3 reduce scanner noise / JPEG ringing while
+            keeping hard edges sharp via the blur_delta guard.
+            (imagetracerjs: blurradius default 0, max recommended 5.)
+        blur_delta: Pixel intensity delta threshold for the selective blur:
+            pixels where |original − blurred| > blur_delta are edge pixels and
+            are restored to the original value.  Default 20.
+            (imagetracerjs: blurdelta default 20.)
 
     Returns:
         (original_bgr, gray_image, binary_image)
@@ -142,6 +181,12 @@ def load_and_preprocess(
     # correctly-oriented image.
     if deskew:
         gray = _deskew(gray, min_angle_deg=deskew_min_angle)
+
+    # Edge-preserving selective blur (imagetracerjs §preprocess).  Applied
+    # after deskew so we smooth the already-aligned image, and before
+    # thresholding so the threshold benefits from reduced noise.
+    if blur_radius > 0:
+        gray = _selective_blur(gray, blur_radius, blur_delta)
 
     gray_out = gray.copy()   # preserve pre-threshold grayscale for Canny
 

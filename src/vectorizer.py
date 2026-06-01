@@ -25,6 +25,7 @@ Pipeline
 """
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Optional
 
@@ -162,6 +163,53 @@ def _simplify(contour_cv2: np.ndarray, epsilon: float) -> np.ndarray:
     if sq.ndim == 1:
         sq = sq.reshape(1, 2)
     return sq.astype(np.int32)
+
+
+# ── Right-angle corner enhancement (imagetracerjs §internodes) ───────────────
+
+def _snap_right_angles(pts: np.ndarray, tol_deg: float = 10.0) -> np.ndarray:
+    """Snap near-90° corners to exact right angles.
+
+    Implements the imagetracerjs right-angle enhancement heuristic: for each
+    interior vertex B in polyline A–B–C, if the turn angle at B is within
+    *tol_deg* of 90°, snap the outgoing segment direction to be exactly
+    perpendicular to the incoming segment direction while preserving the
+    outgoing segment length.
+
+    This produces clean axis-aligned corners in architectural drawings without
+    modifying vertices that are not near-orthogonal turns.
+
+    Args:
+        pts:     (N, 2) integer vertex array from DP simplification.
+        tol_deg: Tolerance in degrees around 90°.  A corner qualifies when
+                 |angle − 90°| ≤ tol_deg.  Default 10°.
+
+    Returns:
+        (N, 2) integer vertex array with snapped corners.
+    """
+    if len(pts) < 3:
+        return pts
+    result = pts.astype(float).copy()
+    # cos_tol: maximum |cos(angle)| to qualify as near-90°
+    cos_tol = math.cos(math.radians(90.0 - tol_deg))
+    for i in range(1, len(result) - 1):
+        a, b, c = result[i - 1], result[i], result[i + 1]
+        v1 = b - a          # incoming direction (A→B)
+        v2 = c - b          # outgoing direction (B→C)
+        n1 = math.hypot(v1[0], v1[1])
+        n2 = math.hypot(v2[0], v2[1])
+        if n1 < 1e-9 or n2 < 1e-9:
+            continue
+        cos_a = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+        if abs(cos_a) > cos_tol:
+            continue
+        # Near-90°: snap C so that B→C is exactly perpendicular to A→B.
+        u = v1 / n1                               # unit vector along A→B
+        perp = np.array([-u[1], u[0]])            # 90° CCW rotation
+        if (v2[0] * perp[0] + v2[1] * perp[1]) < 0:
+            perp = -perp                          # choose closest 90° direction
+        result[i + 1] = b + perp * n2
+    return np.round(result).astype(np.int32)
 
 
 # ── Circle / arc fitting (DXF Section 5: native ARC/CIRCLE + bulge) ────────────
@@ -400,6 +448,9 @@ def extract_lines_and_contours(
     merge_lines: bool = True,
     snap_radius: float = 4.0,
     pre_close_kernel: int = 0,
+    # Right-angle corner enhancement (imagetracerjs §internodes)
+    right_angle_enhance: bool = False,
+    right_angle_tol: float = 10.0,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
@@ -438,6 +489,13 @@ def extract_lines_and_contours(
                        divert circle/arc-shaped contours into ``arcs``.  When
                        False (default), behaves exactly as the 2-tuple API and
                        does not divert any geometry.
+        right_angle_enhance: After DP simplification, snap corners whose angle
+                       is within right_angle_tol degrees of 90° to exact right
+                       angles.  Improves output quality for architectural and
+                       mechanical drawings with orthogonal geometry.
+                       (imagetracerjs: rightangleenhance, default false here.)
+        right_angle_tol: Tolerance in degrees around 90° for the enhancement.
+                       Default 10°.
 
     Returns:
         (lines, contours)              when return_arcs is False
@@ -493,6 +551,9 @@ def extract_lines_and_contours(
         pts = _simplify(c, eps)
         if len(pts) < 2:
             continue
+
+        if right_angle_enhance and len(pts) >= 3:
+            pts = _snap_right_angles(pts, tol_deg=right_angle_tol)
 
         closed = _is_closed(c, tol_px=max(4.0, eps * 2))
 

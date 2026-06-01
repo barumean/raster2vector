@@ -59,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
     pre.add_argument("--deskew", action="store_true",
                      help="Auto-correct rotational skew before binarisation using "
                           "the dominant angle of horizontal line blobs")
+    pre.add_argument("--blur-radius", type=int, default=0, metavar="N",
+                     help="Edge-preserving Gaussian blur radius before thresholding "
+                          "(0=off). Reduces scanner noise / JPEG ringing while "
+                          "keeping hard edges sharp. Try 1–3 for scanned drawings. "
+                          "(imagetracerjs selective blur, blurradius)")
+    pre.add_argument("--blur-delta", type=int, default=20, metavar="N",
+                     help="Intensity delta threshold for selective blur: pixels "
+                          "where |original−blurred|>N are restored as edges. "
+                          "Default 20. (imagetracerjs blurdelta)")
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
@@ -106,6 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--stroke-width", action="store_true",
                      help="Estimate stroke width per entity (SPV) and write DXF "
                           "lineweights so dimension lines vs. boundary lines differ")
+    vec.add_argument("--right-angle-enhance", action="store_true",
+                     help="Snap near-90° corners to exact right angles after "
+                          "simplification. Improves output for architectural and "
+                          "mechanical drawings with orthogonal geometry. "
+                          "(imagetracerjs rightangleenhance)")
+    vec.add_argument("--right-angle-tol", type=float, default=10.0, metavar="DEG",
+                     help="Tolerance in degrees around 90° for right-angle snapping "
+                          "(default 10°)")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -199,6 +216,8 @@ def main(argv=None) -> int:
             despeckle=not args.no_despeckle,
             min_speckle_area=args.min_speckle_area,
             deskew=args.deskew,
+            blur_radius=args.blur_radius,
+            blur_delta=args.blur_delta,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -256,6 +275,8 @@ def main(argv=None) -> int:
         merge_lines=not args.no_merge_lines,
         snap_radius=args.snap_radius,
         pre_close_kernel=args.pre_close_kernel,
+        right_angle_enhance=args.right_angle_enhance,
+        right_angle_tol=args.right_angle_tol,
     )
 
     if args.verbose:

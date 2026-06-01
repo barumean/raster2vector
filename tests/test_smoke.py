@@ -7,13 +7,14 @@ import ezdxf
 import numpy as np
 import pytest
 
-from src.preprocessor import load_and_preprocess
+from src.preprocessor import load_and_preprocess, _selective_blur
 from src.text_separator import separate_text_and_graphics
 from src.vectorizer import (
     extract_lines_and_contours,
     _merge_collinear_lines,
     _snap_endpoints,
     _fit_circle,
+    _snap_right_angles,
 )
 from src.dxf_exporter import _bulge_from_3pts, export_to_dxf as _export
 from src.stroke_width import estimate_line_widths, estimate_contour_widths, _DXF_WEIGHTS
@@ -438,3 +439,81 @@ def test_layer_names(square_image_path, dxf_out):
     assert "LINES" in layer_names
     assert "CONTOURS" in layer_names
     assert "TEXT_CANDIDATES" in layer_names
+
+
+# ── Selective blur tests ──────────────────────────────────────────────────────
+
+def test_selective_blur_smooths_flat_region():
+    """Flat uniform region is smoothed by selective blur."""
+    gray = np.full((50, 50), 128, dtype=np.uint8)
+    # Add noise in the flat region
+    rng = np.random.default_rng(42)
+    noise = rng.integers(-10, 10, gray.shape).astype(np.int16)
+    noisy = np.clip(gray.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    result = _selective_blur(noisy, radius=2, delta=20)
+    # The blurred flat region should be closer to the true value than the noisy input
+    assert float(np.abs(result.astype(float) - 128).mean()) < \
+           float(np.abs(noisy.astype(float) - 128).mean())
+
+
+def test_selective_blur_preserves_edges():
+    """Sharp edges (large gradient) are not blurred away."""
+    gray = np.zeros((50, 100), dtype=np.uint8)
+    gray[:, 50:] = 200   # hard step edge at x=50
+    result = _selective_blur(gray, radius=3, delta=20)
+    # The step should still be present: pixel at edge is unblurred
+    assert result[25, 49] < 50    # left side stays dark
+    assert result[25, 50] > 150   # right side stays bright
+
+
+def test_selective_blur_zero_radius_noop():
+    """blur_radius=0 returns the image unchanged."""
+    gray = np.random.default_rng(0).integers(0, 255, (60, 60), dtype=np.uint8)
+    result = _selective_blur(gray, radius=0)
+    np.testing.assert_array_equal(result, gray)
+
+
+def test_load_preprocess_blur_radius(square_image_path):
+    """blur_radius param is accepted and does not crash."""
+    _, gray, binary = load_and_preprocess(square_image_path, blur_radius=2, blur_delta=20)
+    assert binary.shape == gray.shape
+    assert binary.dtype == np.uint8
+
+
+# ── Right-angle enhancement tests ─────────────────────────────────────────────
+
+def test_snap_right_angles_exact_90():
+    """A corner that is already exactly 90° is unchanged."""
+    pts = np.array([[0, 0], [10, 0], [10, 10]], dtype=np.int32)
+    result = _snap_right_angles(pts, tol_deg=10.0)
+    np.testing.assert_array_equal(result, pts)
+
+
+def test_snap_right_angles_near_90_snapped():
+    """A near-90° corner (within tolerance) is snapped to exactly 90°."""
+    # Incoming: horizontal (0→10, 0→0); outgoing: slightly off-vertical (10→10, 0→11)
+    pts = np.array([[0, 0], [10, 0], [10, 11]], dtype=np.int32)
+    result = _snap_right_angles(pts, tol_deg=15.0)
+    # After snapping, v2 should be perpendicular to v1 = (10,0), i.e. vertical
+    v1 = result[1] - result[0]
+    v2 = result[2] - result[1]
+    dot = int(v1[0]) * int(v2[0]) + int(v1[1]) * int(v2[1])
+    # dot product of perpendicular vectors is 0
+    assert abs(dot) <= 1, f"Not right-angle after snap: dot={dot}"
+
+
+def test_snap_right_angles_far_from_90_unchanged():
+    """A corner far from 90° is not modified."""
+    # 45° corner: A=(0,0) B=(10,0) C=(20,10) — turn angle = 45°
+    pts = np.array([[0, 0], [10, 0], [20, 10]], dtype=np.int32)
+    result = _snap_right_angles(pts, tol_deg=10.0)
+    np.testing.assert_array_equal(result[0], pts[0])
+    np.testing.assert_array_equal(result[1], pts[1])
+
+
+def test_right_angle_enhance_cli(square_image_path, dxf_out):
+    """--right-angle-enhance flag runs without error end-to-end."""
+    from raster2vector import main
+    ret = main([square_image_path, "-o", dxf_out, "--right-angle-enhance"])
+    assert ret == 0
+    assert os.path.exists(dxf_out)
