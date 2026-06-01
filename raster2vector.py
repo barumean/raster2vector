@@ -123,6 +123,23 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--right-angle-tol", type=float, default=10.0, metavar="DEG",
                      help="Tolerance in degrees around 90° for right-angle snapping "
                           "(default 10°)")
+    vec.add_argument("--remove-staircase", action="store_true",
+                     help="Remove 1-pixel 45° staircase artefacts from raw contour "
+                          "points before Douglas-Peucker simplification. Useful on "
+                          "low-DPI scans with heavy pixel aliasing. "
+                          "(vtracer: remove_staircase)")
+    vec.add_argument("--corner-threshold", type=float, default=60.0, metavar="DEG",
+                     help="Turn-angle threshold (degrees) for corner detection used "
+                          "in segmented arc extraction. When a contour cannot be "
+                          "fitted as a single arc, it is split at corners and "
+                          "curvature inflections and arc fitting is re-attempted "
+                          "per segment. Set to 0 to disable. Default 60°. "
+                          "(vtracer: corner_threshold)")
+    vec.add_argument("--splice-threshold", type=float, default=45.0, metavar="DEG",
+                     help="Maximum angular span per arc segment for splice-point "
+                          "detection (degrees). Prevents a single fitted arc from "
+                          "spanning more than this arc angle. Default 45°. "
+                          "(vtracer: splice_threshold)")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -277,6 +294,9 @@ def main(argv=None) -> int:
         pre_close_kernel=args.pre_close_kernel,
         right_angle_enhance=args.right_angle_enhance,
         right_angle_tol=args.right_angle_tol,
+        remove_staircase=args.remove_staircase,
+        corner_threshold=args.corner_threshold,
+        splice_threshold=args.splice_threshold,
     )
 
     if args.verbose:

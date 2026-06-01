@@ -165,6 +165,170 @@ def _simplify(contour_cv2: np.ndarray, epsilon: float) -> np.ndarray:
     return sq.astype(np.int32)
 
 
+# ── vtracer: staircase removal, corner detection, splice-point segmentation ──
+
+def _remove_staircase(pts: np.ndarray, closed: bool = True) -> np.ndarray:
+    """Remove 1-pixel diagonal staircase artifacts from a contour (vtracer).
+
+    A "staircase step" is a vertex B between A and B where both segments AB
+    and BC have Chebyshev length 1 (single 8-connected pixel steps) and the
+    turn at B is convex relative to the path orientation.  Removing such a
+    vertex does not change the represented shape — it is pure pixel aliasing.
+
+    This pass runs in O(n) before Douglas-Peucker and eliminates the
+    systematic 45° artifacts that DP preserves because they happen to be the
+    maximum-error outlier in each neighbourhood.
+
+    Reference: visioncortex/src/path/simplify.rs  remove_staircase()
+
+    Args:
+        pts:    (N, 2) integer contour array (from findContours / _simplify).
+        closed: Whether the contour is a closed loop (wraps around).
+
+    Returns:
+        Filtered (M, 2) integer array with staircase vertices removed.
+    """
+    pts = pts.reshape(-1, 2)
+    n = len(pts)
+    if n < 3:
+        return pts
+    # Signed area (shoelace) to determine CW vs CCW orientation.
+    x, y = pts[:, 0].astype(float), pts[:, 1].astype(float)
+    area2 = float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+    cw = area2 < 0  # negative signed area → clockwise in image coords
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not keep[i]:
+            continue
+        prev_i = (i - 1) % n if closed else max(i - 1, 0)
+        next_i = (i + 1) % n if closed else min(i + 1, n - 1)
+        if prev_i == i or next_i == i:
+            continue
+        p = pts[prev_i].astype(float)
+        c = pts[i].astype(float)
+        q = pts[next_i].astype(float)
+        d1 = c - p  # A → B
+        d2 = q - c  # B → C
+        # Both segments must be single 8-connected pixel steps (Chebyshev = 1).
+        if max(abs(d1[0]), abs(d1[1])) != 1 or max(abs(d2[0]), abs(d2[1])) != 1:
+            continue
+        cross = d1[0] * d2[1] - d1[1] * d2[0]
+        # Convex step relative to path orientation → remove.
+        if (cross > 0) == cw:
+            keep[i] = False
+    return pts[keep]
+
+
+def _detect_corners(pts: np.ndarray, threshold_deg: float = 60.0) -> np.ndarray:
+    """Mark vertices where the tangent direction changes sharply (vtracer).
+
+    A vertex is a corner when |signed angle change| ≥ threshold_deg.
+    Corner vertices act as mandatory segment boundaries: the arc/Bezier
+    fitter is never allowed to span a detected corner.
+
+    Reference: visioncortex/src/path/smooth.rs  find_corners()
+
+    Args:
+        pts:           (N, 2) float-or-int vertex array.
+        threshold_deg: Turn-angle threshold in degrees (default 60°, same as
+                       vtracer's ``corner_threshold`` default).
+
+    Returns:
+        Boolean (N,) array; True = corner.
+    """
+    threshold_rad = math.radians(threshold_deg)
+    n = len(pts)
+    corners = np.zeros(n, dtype=bool)
+    for i in range(n):
+        v1 = pts[i].astype(float) - pts[(i - 1) % n].astype(float)
+        v2 = pts[(i + 1) % n].astype(float) - pts[i].astype(float)
+        n1 = math.hypot(float(v1[0]), float(v1[1]))
+        n2 = math.hypot(float(v2[0]), float(v2[1]))
+        if n1 < 1e-9 or n2 < 1e-9:
+            corners[i] = True
+            continue
+        a1 = math.atan2(float(v1[1]), float(v1[0]))
+        a2 = math.atan2(float(v2[1]), float(v2[0]))
+        diff = a2 - a1
+        diff = (diff + math.pi) % (2 * math.pi) - math.pi  # to (−π, π]
+        if abs(diff) >= threshold_rad:
+            corners[i] = True
+    return corners
+
+
+def _find_splice_points(pts: np.ndarray, threshold_deg: float = 45.0) -> np.ndarray:
+    """Find curvature inflection / accumulated-angle splice points (vtracer).
+
+    A splice point is triggered by either:
+    1. A curvature sign change (inflection: path switches from left- to
+       right-turning or vice versa).
+    2. The cumulative angular displacement since the last splice reaching
+       threshold_deg (prevents any single arc segment spanning > threshold).
+
+    Both conditions together ensure monotone-curvature spans, which can be
+    accurately represented by a single arc or cubic Bezier.
+
+    Reference: visioncortex/src/path/spline.rs  find_splice_points()
+
+    Args:
+        pts:           (N, 2) vertex array.
+        threshold_deg: Max angular span per segment (default 45°).
+
+    Returns:
+        Boolean (N,) array; True = splice boundary.
+    """
+    threshold_rad = math.radians(threshold_deg)
+    n = len(pts)
+    splices = np.zeros(n, dtype=bool)
+    is_increasing: bool | None = None
+    angle_disp = 0.0
+    for i in range(n):
+        v1 = pts[i].astype(float) - pts[(i - 1) % n].astype(float)
+        v2 = pts[(i + 1) % n].astype(float) - pts[i].astype(float)
+        n1 = math.hypot(float(v1[0]), float(v1[1]))
+        n2 = math.hypot(float(v2[0]), float(v2[1]))
+        if n1 < 1e-9 or n2 < 1e-9:
+            splices[i] = True
+            angle_disp = 0.0
+            is_increasing = None
+            continue
+        a1 = math.atan2(float(v1[1]), float(v1[0]))
+        a2 = math.atan2(float(v2[1]), float(v2[0]))
+        diff = a2 - a1
+        diff = (diff + math.pi) % (2 * math.pi) - math.pi
+        currently_increasing = diff >= 0
+        if is_increasing is None:
+            is_increasing = currently_increasing
+        elif is_increasing != currently_increasing:
+            splices[i] = True          # inflection
+            is_increasing = currently_increasing
+        angle_disp += diff
+        if abs(angle_disp) >= threshold_rad:
+            splices[i] = True          # arc span limit
+        if splices[i]:
+            angle_disp = 0.0
+    return splices
+
+
+def _split_at_marks(pts: np.ndarray, marks: np.ndarray) -> list[np.ndarray]:
+    """Split pts at marked positions, returning a list of sub-arrays.
+
+    Each sub-array starts at a marked index (or 0) and ends at the next mark
+    (inclusive).  Short segments (< 2 points) are discarded.
+
+    Args:
+        pts:   (N, 2) vertex array.
+        marks: Boolean (N,) array; True = split here.
+
+    Returns:
+        List of (M, 2) sub-arrays.
+    """
+    indices = sorted({0} | set(int(i) for i in np.where(marks)[0]) | {len(pts) - 1})
+    return [pts[indices[k]:indices[k + 1] + 1]
+            for k in range(len(indices) - 1)
+            if indices[k + 1] - indices[k] >= 1]
+
+
 # ── Right-angle corner enhancement (imagetracerjs §internodes) ───────────────
 
 def _snap_right_angles(pts: np.ndarray, tol_deg: float = 10.0) -> np.ndarray:
@@ -451,6 +615,10 @@ def extract_lines_and_contours(
     # Right-angle corner enhancement (imagetracerjs §internodes)
     right_angle_enhance: bool = False,
     right_angle_tol: float = 10.0,
+    # vtracer-inspired curve segmentation
+    remove_staircase: bool = False,
+    corner_threshold: float = 60.0,
+    splice_threshold: float = 45.0,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
@@ -496,6 +664,24 @@ def extract_lines_and_contours(
                        (imagetracerjs: rightangleenhance, default false here.)
         right_angle_tol: Tolerance in degrees around 90° for the enhancement.
                        Default 10°.
+        remove_staircase: Apply O(n) staircase removal to raw contour points
+                       before Douglas-Peucker simplification.  Removes the
+                       systematic 1-pixel 45° step artefacts that DP cannot
+                       fix without destroying corner geometry.  Most useful on
+                       low-DPI scans.  (vtracer: remove_staircase, default
+                       False here.)
+        corner_threshold: Turn-angle threshold in degrees for segmented arc
+                       extraction.  When ``_try_fit_arc`` fails on a whole
+                       contour, the pipeline re-attempts fitting by splitting
+                       the contour at detected corners (|turn| ≥ threshold)
+                       and at curvature inflection / splice points.  Arc and
+                       line fits are applied per segment.  Default 60°
+                       (vtracer's corner_threshold default).  Set to 0 to
+                       disable segmented arc extraction.
+        splice_threshold: Maximum angular span (degrees) per arc segment for
+                       the splice-point detector.  Prevents any single fitted
+                       arc from spanning more than this many degrees of
+                       curvature.  Default 45°.  (vtracer: splice_threshold.)
 
     Returns:
         (lines, contours)              when return_arcs is False
@@ -548,7 +734,19 @@ def extract_lines_and_contours(
     arc_tolerance = arc_tol if arc_tol is not None else max(2.0, image_diag * 0.005)
 
     for c in filtered:
-        pts = _simplify(c, eps)
+        # ── Staircase removal (vtracer) before DP ────────────────────────────
+        raw_pts = c.reshape(-1, 2)
+        if remove_staircase and len(raw_pts) >= 3:
+            closed_raw = _is_closed(c, tol_px=max(4.0, eps * 2))
+            raw_pts = _remove_staircase(raw_pts, closed=closed_raw)
+            if len(raw_pts) < 2:
+                continue
+            # Re-wrap for approxPolyDP (needs (N,1,2) shape)
+            c_work = raw_pts.reshape(-1, 1, 2).astype(np.int32)
+        else:
+            c_work = c
+
+        pts = _simplify(c_work, eps)
         if len(pts) < 2:
             continue
 
@@ -566,6 +764,46 @@ def extract_lines_and_contours(
         ):
             # Curved contour that fits a circle/arc → compact CAD primitive
             arcs.append(arc)
+        elif (return_arcs and detect_arcs and corner_threshold > 0
+              and len(pts) >= 5):
+            # ── Segmented arc extraction (vtracer corner+splice) ───────────
+            # _try_fit_arc rejected the whole contour.  Split at detected
+            # corners and curvature splice points, then try arc/line fitting
+            # on each monotone-curvature segment independently.
+            corners_mask = _detect_corners(pts, threshold_deg=corner_threshold)
+            splices_mask = _find_splice_points(pts, threshold_deg=splice_threshold)
+            marks = corners_mask | splices_mask
+            if marks.any():
+                segs = _split_at_marks(pts, marks)
+                extracted_any = False
+                leftover: list[np.ndarray] = []
+                for seg in segs:
+                    if len(seg) < 2:
+                        continue
+                    if _is_straight(seg, max_line_deviation):
+                        lines.append((int(seg[0, 0]), int(seg[0, 1]),
+                                      int(seg[-1, 0]), int(seg[-1, 1])))
+                        extracted_any = True
+                    else:
+                        seg_arc = _try_fit_arc(
+                            seg, False, arc_tolerance, image_diag=image_diag
+                        )
+                        if seg_arc:
+                            arcs.append(seg_arc)
+                            extracted_any = True
+                        else:
+                            leftover.append(seg)
+                if extracted_any:
+                    contours.extend(leftover)
+                    # Paint all segments onto the mask
+                    for seg in segs:
+                        cv2.polylines(
+                            contour_mask,
+                            [seg.reshape(-1, 1, 2)],
+                            isClosed=False, color=255, thickness=3,
+                        )
+                    continue   # skip the single-polyline fallback below
+            contours.append(pts)
         else:
             contours.append(pts)
 

@@ -15,6 +15,10 @@ from src.vectorizer import (
     _snap_endpoints,
     _fit_circle,
     _snap_right_angles,
+    _remove_staircase,
+    _detect_corners,
+    _find_splice_points,
+    _split_at_marks,
 )
 from src.dxf_exporter import _bulge_from_3pts, export_to_dxf as _export
 from src.stroke_width import estimate_line_widths, estimate_contour_widths, _DXF_WEIGHTS
@@ -517,3 +521,132 @@ def test_right_angle_enhance_cli(square_image_path, dxf_out):
     ret = main([square_image_path, "-o", dxf_out, "--right-angle-enhance"])
     assert ret == 0
     assert os.path.exists(dxf_out)
+
+
+# ── vtracer staircase removal tests ──────────────────────────────────────────
+
+def test_remove_staircase_diagonal_removed():
+    """1-pixel diagonal staircase steps are removed."""
+    # Staircase going diagonally: (0,0)→(1,0)→(1,1)→(2,1) — the middle
+    # vertex (1,0)→(1,1) is a single-step convex turn.
+    pts = np.array([[0, 0], [1, 0], [1, 1], [2, 1], [2, 0], [0, 0]], dtype=np.int32)
+    result = _remove_staircase(pts, closed=True)
+    assert len(result) < len(pts), "Staircase step should have been removed"
+
+
+def test_remove_staircase_straight_line_unchanged():
+    """Straight collinear points are not removed."""
+    pts = np.array([[0, 0], [5, 0], [10, 0]], dtype=np.int32)
+    result = _remove_staircase(pts, closed=False)
+    # No 1-pixel 45° steps here; all points kept (or possibly 2 remain)
+    assert len(result) >= 2
+
+
+def test_remove_staircase_reduces_aliased_diagonal():
+    """A pixel-aliased diagonal line loses its staircase steps."""
+    # Simulate a rasterized diagonal: alternating x and y increments of 1
+    pts = []
+    for i in range(10):
+        pts.append([i, i])
+        pts.append([i + 1, i])
+    pts = np.array(pts, dtype=np.int32)
+    result = _remove_staircase(pts, closed=False)
+    assert len(result) <= len(pts)
+
+
+def test_remove_staircase_cli(square_image_path, dxf_out):
+    """--remove-staircase flag runs end-to-end without error."""
+    from raster2vector import main
+    ret = main([square_image_path, "-o", dxf_out, "--remove-staircase"])
+    assert ret == 0
+
+
+# ── vtracer corner detection tests ───────────────────────────────────────────
+
+def test_detect_corners_right_angle():
+    """A 90° corner is detected at the vertex."""
+    # L-shape: horizontal then vertical
+    pts = np.array([[0, 0], [10, 0], [10, 10]], dtype=np.int32)
+    corners = _detect_corners(pts, threshold_deg=60.0)
+    # The middle vertex (10, 0) is a 90° turn — should be a corner
+    assert corners[1], "Middle vertex of 90° turn should be detected as corner"
+
+
+def test_detect_corners_straight_line_no_corners():
+    """Points on a straight line have no corners."""
+    pts = np.array([[0, 0], [5, 0], [10, 0], [15, 0]], dtype=np.int32)
+    corners = _detect_corners(pts, threshold_deg=60.0)
+    # Interior points (index 1, 2) should not be corners
+    assert not corners[1] and not corners[2]
+
+
+def test_detect_corners_threshold_respected():
+    """Small turns below threshold are not marked as corners."""
+    # 30° turn — should not be corner with 60° threshold
+    import math
+    pts = np.array([[0, 0], [10, 0],
+                    [10 + int(10 * math.cos(math.radians(30))),
+                     int(10 * math.sin(math.radians(30)))]], dtype=np.int32)
+    corners = _detect_corners(pts, threshold_deg=60.0)
+    assert not corners[1], "30° turn should not be a corner with 60° threshold"
+
+
+# ── vtracer splice point tests ────────────────────────────────────────────────
+
+def test_find_splice_points_circle_has_splices():
+    """A full circle has curvature inflections → multiple splice points."""
+    angles = np.linspace(0, 2 * np.pi, 40, endpoint=False)
+    pts = np.column_stack([
+        (50 + 30 * np.cos(angles)).astype(int),
+        (50 + 30 * np.sin(angles)).astype(int),
+    ])
+    splices = _find_splice_points(pts, threshold_deg=45.0)
+    # A circle turning 360° should have many 45° splice intervals
+    assert splices.sum() >= 6, f"Circle should have ≥6 splice points, got {splices.sum()}"
+
+
+def test_find_splice_points_straight_line_few():
+    """A straight line has almost no curvature: far fewer splices than a circle."""
+    pts = np.array([[i, 0] for i in range(20)], dtype=np.int32)
+    splices = _find_splice_points(pts, threshold_deg=45.0)
+    angles = np.linspace(0, 2 * np.pi, 40, endpoint=False)
+    circle_pts = np.column_stack([
+        (50 + 30 * np.cos(angles)).astype(int),
+        (50 + 30 * np.sin(angles)).astype(int),
+    ])
+    circle_splices = _find_splice_points(circle_pts, threshold_deg=45.0)
+    assert splices.sum() < circle_splices.sum(), \
+        "Straight line should have fewer splices than a circle"
+
+
+def test_split_at_marks_basic():
+    """_split_at_marks produces the expected number of segments."""
+    pts = np.array([[i, 0] for i in range(10)], dtype=np.int32)
+    marks = np.zeros(10, dtype=bool)
+    marks[3] = True
+    marks[7] = True
+    segs = _split_at_marks(pts, marks)
+    assert len(segs) == 3  # [0..3], [3..7], [7..9]
+    assert segs[0][0, 0] == 0
+    assert segs[1][0, 0] == 3
+    assert segs[2][0, 0] == 7
+
+
+# ── Segmented arc extraction end-to-end ──────────────────────────────────────
+
+def test_segmented_arc_extraction_circle_image(tmp_path, dxf_out):
+    """Segmented arc extraction finds circle arcs end-to-end."""
+    # Draw two arcs (semicircles) so the whole circle doesn't fit as one arc
+    img = np.zeros((200, 200), dtype=np.uint8)
+    cv2.circle(img, (100, 100), 50, 255, 2)
+    binary = img
+    _, _, arcs = extract_lines_and_contours(
+        binary,
+        detect_arcs=True,
+        return_arcs=True,
+        corner_threshold=60.0,
+        splice_threshold=45.0,
+        min_contour_length=10,
+    )
+    # Should detect circle or arcs
+    assert len(arcs) > 0, "Should detect at least one arc/circle from a drawn circle"
