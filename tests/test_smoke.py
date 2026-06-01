@@ -19,6 +19,9 @@ from src.vectorizer import (
     _detect_corners,
     _find_splice_points,
     _split_at_marks,
+    _gap_jump,
+    _orthogonalize,
+    _detect_dashed_lines,
 )
 from src.dxf_exporter import _bulge_from_3pts, export_to_dxf as _export
 from src.stroke_width import estimate_line_widths, estimate_contour_widths, _DXF_WEIGHTS
@@ -650,3 +653,135 @@ def test_segmented_arc_extraction_circle_image(tmp_path, dxf_out):
     )
     # Should detect circle or arcs
     assert len(arcs) > 0, "Should detect at least one arc/circle from a drawn circle"
+
+
+# ── Gap-jump tests ────────────────────────────────────────────────────────────
+
+def test_gap_jump_bridges_small_gap():
+    """Gap-jump adds a bridge for two nearly-touching collinear segment ends."""
+    # Segment A: (0,0)→(40,0); Segment B: (45,0)→(90,0) — gap of 5px
+    lines = [(0, 0, 40, 0), (45, 0, 90, 0)]
+    result = _gap_jump(lines, gap_px=10.0, fan_deg=20.0)
+    assert len(result) > len(lines), "Should have added at least one bridge"
+    # Bridge should connect A's end (40,0) to B's start (45,0)
+    bridges = result[len(lines):]
+    assert any(b[0] == 40 and b[2] == 45 for b in bridges), \
+        f"Expected bridge (40,0)→(45,0), got {bridges}"
+
+
+def test_gap_jump_no_bridge_for_corner():
+    """Gap-jump does NOT bridge endpoints that form a genuine corner (T-junction)."""
+    # Horizontal A ends at (50,0); vertical B starts at (50,0) upward
+    # Their endpoints coincide but directions are perpendicular — not a gap
+    lines = [(0, 0, 50, 0), (50, 0, 50, 50)]
+    result = _gap_jump(lines, gap_px=10.0, fan_deg=20.0)
+    # No bridge should be added (these endpoints touch and are orthogonal)
+    assert len(result) == len(lines), "Should not bridge a corner junction"
+
+
+def test_gap_jump_ignores_large_gap():
+    """Gap-jump does not bridge a gap larger than gap_px."""
+    lines = [(0, 0, 40, 0), (80, 0, 120, 0)]  # gap = 40 px
+    result = _gap_jump(lines, gap_px=15.0, fan_deg=20.0)
+    assert len(result) == len(lines), "Gap of 40px > 15px limit should not be bridged"
+
+
+def test_gap_jump_cli(square_image_path, dxf_out):
+    """--gap-jump flag runs end-to-end without error."""
+    from raster2vector import main
+    ret = main([square_image_path, "-o", dxf_out, "--gap-jump", "--gap-px", "10"])
+    assert ret == 0
+
+
+# ── Orthogonalization tests ───────────────────────────────────────────────────
+
+def test_orthogonalize_snaps_near_horizontal():
+    """A line within 2° of horizontal is snapped to exact horizontal."""
+    # 1° off horizontal
+    import math
+    angle_rad = math.radians(1.0)
+    x1, y1 = 0, 0
+    x2 = int(100 * math.cos(angle_rad))
+    y2 = int(100 * math.sin(angle_rad))
+    lines = [(x1, y1, x2, y2)]
+    result = _orthogonalize(lines, base_angle_deg=0.0, accuracy_deg=2.0)
+    rx1, ry1, rx2, ry2 = result[0]
+    assert ry1 == ry2, f"Snapped line should be exactly horizontal (y1={ry1}, y2={ry2})"
+
+
+def test_orthogonalize_snaps_near_vertical():
+    """A line within 2° of vertical is snapped to exact vertical."""
+    import math
+    angle_rad = math.radians(89.0)  # 1° off vertical
+    # Use length=500 so integer rounding doesn't swamp the 1° offset
+    x2 = int(500 * math.cos(angle_rad))
+    y2 = int(500 * math.sin(angle_rad))
+    lines = [(0, 0, x2, y2)]
+    result = _orthogonalize(lines, base_angle_deg=0.0, accuracy_deg=2.0)
+    rx1, ry1, rx2, ry2 = result[0]
+    assert rx1 == rx2, f"Snapped line should be exactly vertical (x1={rx1}, x2={rx2})"
+
+
+def test_orthogonalize_leaves_diagonal_unchanged():
+    """A 45° diagonal is not modified by orthogonalization."""
+    lines = [(0, 0, 70, 70)]
+    result = _orthogonalize(lines, base_angle_deg=0.0, accuracy_deg=2.0)
+    assert result[0] == lines[0], "45° diagonal should not be snapped"
+
+
+def test_orthogonalize_cli(square_image_path, dxf_out):
+    """--orthogonalize flag runs end-to-end without error."""
+    from raster2vector import main
+    ret = main([square_image_path, "-o", dxf_out, "--orthogonalize"])
+    assert ret == 0
+
+
+# ── Dashed-line detection tests ───────────────────────────────────────────────
+
+def _make_dashed_lines(n=6, dash=15, gap=10, y=50, x_start=10):
+    """Synthetic horizontal dashed line: n dashes of length dash, gap spacing."""
+    segs = []
+    x = x_start
+    for _ in range(n):
+        segs.append((x, y, x + dash, y))
+        x += dash + gap
+    return segs
+
+
+def test_detect_dashed_lines_finds_pattern():
+    """Detects a clean periodic dashed horizontal line."""
+    dashes = _make_dashed_lines(n=5, dash=15, gap=10)
+    solid, groups = _detect_dashed_lines(dashes, max_dash_len_px=20.0, min_dash_count=3)
+    assert len(groups) >= 1, f"Should detect 1 dashed group, got {groups}"
+    assert len(solid) == 0, "All segments should be classified as dashed"
+
+
+def test_detect_dashed_lines_ignores_solid():
+    """Long solid segments are not confused with dashes."""
+    # One long line (not a dash) and a separate cluster of dashes
+    long_line = (0, 10, 200, 10)  # length 200, above max_dash_len_px
+    dashes = _make_dashed_lines(n=5, dash=15, gap=10, y=80)
+    all_lines = [long_line] + dashes
+    solid, groups = _detect_dashed_lines(all_lines, max_dash_len_px=20.0, min_dash_count=3)
+    assert long_line in solid, "Long solid line should remain in solid output"
+    assert len(groups) >= 1, "Dashed group should still be detected"
+
+
+def test_detect_dashes_written_to_dxf(tmp_path):
+    """Dashed lines are written to the DASHED layer in DXF output."""
+    dashes = _make_dashed_lines(n=5, dash=15, gap=10)
+    out = str(tmp_path / "dashes.dxf")
+    export_to_dxf(
+        lines=[], contours=[], output_path=out, image_height=200,
+        dashed_lines=[dashes],
+    )
+    doc = ezdxf.readfile(out)
+    layer_names = {e.dxf.layer for e in doc.modelspace()}
+    assert "DASHED" in layer_names, "DASHED layer entity should be present"
+
+
+def test_detect_dashes_cli(square_image_path, dxf_out):
+    """--detect-dashes flag runs end-to-end without error."""
+    from raster2vector import main
+    ret = main([square_image_path, "-o", dxf_out, "--detect-dashes"])
+    assert ret == 0

@@ -165,6 +165,284 @@ def _simplify(contour_cv2: np.ndarray, epsilon: float) -> np.ndarray:
     return sq.astype(np.int32)
 
 
+# ── Scan2CAD gap-jump, orthogonalization, dashed-line detection ───────────────
+
+def _gap_jump(
+    lines: list,
+    gap_px: float = 15.0,
+    fan_deg: float = 20.0,
+) -> list:
+    """Bridge near-touching line endpoints (Scan2CAD gap-jump heuristic).
+
+    The most common quality defect in raster→DXF conversion is a single drawn
+    line that becomes 5–10 disconnected segments because of faded ink, scanner
+    noise, or pixel breaks.  Gap-jump closes these by adding a synthetic bridge
+    segment between compatible endpoint pairs.
+
+    Compatibility test for endpoints A (on segment SA) and B (on segment SB):
+      1. distance(A, B) ≤ gap_px
+      2. direction(A → B) is within fan_deg of A's outward direction
+         (i.e. the bridge continues SA naturally past A)
+      3. direction(B → A) is within fan_deg of B's outward direction
+         (i.e. the bridge arrives at B as a natural continuation of SB)
+
+    This prevents bridging corners (two segments meeting at a T-junction).
+
+    Reference: Scan2CAD gap_jump / US Patent 5694536.
+
+    Args:
+        lines:   List of (x1, y1, x2, y2) tuples.
+        gap_px:  Maximum gap distance to bridge (pixels).  Default 15.
+        fan_deg: Half-angle of the directional search cone (degrees).
+
+    Returns:
+        Input lines extended with any synthetic bridge segments.
+    """
+    if not lines or gap_px <= 0:
+        return lines
+
+    cos_fan = math.cos(math.radians(fan_deg))
+
+    # Each endpoint: (x, y, outward_dx, outward_dy, line_index)
+    # "Outward direction" at an endpoint = direction away from the other end.
+    eps: list[tuple[float, float, float, float, int]] = []
+    for i, seg in enumerate(lines):
+        x1, y1, x2, y2 = (float(seg[0]), float(seg[1]),
+                           float(seg[2]), float(seg[3]))
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1e-9:
+            continue
+        ndx, ndy = (x2 - x1) / length, (y2 - y1) / length
+        eps.append((x1, y1, -ndx, -ndy, i))   # start: outward = away from P2
+        eps.append((x2, y2,  ndx,  ndy, i))   # end:   outward = away from P1
+
+    n = len(eps)
+    bridges: list = []
+    used: set = set()
+
+    for a in range(n):
+        ax, ay, adx, ady, ai = eps[a]
+        for b in range(a + 1, n):
+            bx, by, bdx, bdy, bi = eps[b]
+            if ai == bi:          # same segment
+                continue
+            dist = math.hypot(bx - ax, by - ay)
+            if dist < 0.1 or dist > gap_px:
+                continue
+            brdx, brdy = (bx - ax) / dist, (by - ay) / dist
+            # Bridge A→B must align with A's outward direction
+            if adx * brdx + ady * brdy < cos_fan:
+                continue
+            # Reverse bridge B→A must align with B's outward direction
+            if bdx * (-brdx) + bdy * (-brdy) < cos_fan:
+                continue
+            pair = (min(a, b), max(a, b))
+            if pair not in used:
+                used.add(pair)
+                bridges.append((int(round(ax)), int(round(ay)),
+                                int(round(bx)), int(round(by))))
+
+    return lines + bridges
+
+
+def _orthogonalize(
+    lines: list,
+    base_angle_deg: float = 0.0,
+    accuracy_deg: float = 2.0,
+) -> list:
+    """Snap near-horizontal/vertical segments to exact orthogonal angles.
+
+    Engineering and architectural drawings are overwhelmingly axis-aligned.
+    Scanner tilt and digitisation noise introduce small angle errors (0.1–2°)
+    that break CAD operations (region fills, area calculations, trim/extend).
+    This pass snaps any segment within accuracy_deg of base_angle or
+    base_angle+90° to exact H/V while preserving its midpoint and length.
+
+    Reference: Scan2CAD orthogonal_snap / accuracy parameter.
+
+    Args:
+        lines:          List of (x1, y1, x2, y2) tuples.
+        base_angle_deg: Primary axis angle in degrees (default 0 = horizontal).
+        accuracy_deg:   Angular tolerance to trigger snap (default 2°).
+
+    Returns:
+        Orthogonalized line list.
+    """
+    if not lines or accuracy_deg <= 0:
+        return lines
+
+    # Two snap targets: base_angle and base_angle+90 (both mod 180)
+    t0 = base_angle_deg % 180.0
+    t1 = (base_angle_deg + 90.0) % 180.0
+
+    result: list = []
+    for seg in lines:
+        x1, y1, x2, y2 = (float(seg[0]), float(seg[1]),
+                           float(seg[2]), float(seg[3]))
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            result.append(seg)
+            continue
+
+        angle = math.degrees(math.atan2(dy, dx)) % 180.0
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        hl = length / 2.0
+
+        snapped = False
+        for t in (t0, t1):
+            diff = abs(angle - t)
+            diff = min(diff, 180.0 - diff)
+            if diff <= accuracy_deg:
+                t_rad = math.radians(t)
+                cos_t, sin_t = math.cos(t_rad), math.sin(t_rad)
+                # Preserve the general direction of the original segment
+                sign = 1 if (dx * cos_t + dy * sin_t) >= 0 else -1
+                result.append((
+                    int(round(mx - sign * hl * cos_t)),
+                    int(round(my - sign * hl * sin_t)),
+                    int(round(mx + sign * hl * cos_t)),
+                    int(round(my + sign * hl * sin_t)),
+                ))
+                snapped = True
+                break
+        if not snapped:
+            result.append(seg)
+
+    return result
+
+
+def _detect_dashed_lines(
+    lines: list,
+    max_dash_len_px: float = 40.0,
+    angle_tol_deg: float = 3.0,
+    perp_tol_px: float = 4.0,
+    min_dash_count: int = 3,
+    cv_threshold: float = 0.35,
+) -> tuple[list, list[list]]:
+    """Identify runs of collinear short segments forming dashed patterns.
+
+    A dashed line in a scanned drawing vectorises into N short, equi-spaced,
+    collinear segments.  This function groups such segments by direction and
+    perpendicular offset, sorts them along their axis, and checks whether the
+    dash-lengths and gap-lengths have low coefficient of variation (CV).
+
+    If a group passes the periodicity test it is emitted as a dashed group;
+    its constituent segments are removed from the solid-line output.
+
+    Reference: Dori & Liu "How to Win a Dashed Line Detection Contest" (1997);
+    Scan2CAD dash_line_identification parameter.
+
+    Args:
+        lines:           Input line segments.
+        max_dash_len_px: Maximum length (px) for a segment to be a dash
+                         candidate.  Longer segments are never dashes.
+        angle_tol_deg:   Angular bin width for direction grouping.
+        perp_tol_px:     Perpendicular-offset tolerance for same-axis grouping.
+        min_dash_count:  Minimum segments to confirm a dashed pattern.
+        cv_threshold:    Max coefficient of variation for dash/gap lengths.
+
+    Returns:
+        (solid_lines, dashed_groups)
+        solid_lines:   Segments not belonging to any detected dashed pattern.
+        dashed_groups: List of groups; each group is a list of (x1,y1,x2,y2)
+                       tuples sorted along the dash axis.
+    """
+    if not lines:
+        return lines, []
+
+    angle_step = math.radians(angle_tol_deg)
+
+    # Compute properties for each segment
+    props = []
+    for seg in lines:
+        x1, y1, x2, y2 = (float(seg[0]), float(seg[1]),
+                           float(seg[2]), float(seg[3]))
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            props.append(None)
+            continue
+        angle = math.atan2(dy, dx) % math.pi   # [0, π)
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        props.append({'len': length, 'angle': angle, 'mx': mx, 'my': my,
+                      'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+
+    # Candidates = short segments only
+    cands = [(i, p) for i, p in enumerate(props)
+             if p is not None and p['len'] <= max_dash_len_px]
+    if len(cands) < min_dash_count:
+        return lines, []
+
+    # Group by angle bin
+    angle_bins: dict[int, list] = {}
+    for i, p in cands:
+        bk = int(p['angle'] / angle_step)
+        angle_bins.setdefault(bk, []).append((i, p))
+
+    dash_indices: set[int] = set()
+    dashed_groups: list[list] = []
+
+    for members in angle_bins.values():
+        if len(members) < min_dash_count:
+            continue
+        # Reference direction for this angle bin
+        ref_angle = members[0][1]['angle']
+        cos_a, sin_a = math.cos(ref_angle), math.sin(ref_angle)
+        # Perpendicular unit vector
+        perp_x, perp_y = -sin_a, cos_a
+
+        # Sub-group by perpendicular offset (rho)
+        rho_clusters: dict[int, list] = {}
+        for i, p in members:
+            rho = p['mx'] * perp_x + p['my'] * perp_y
+            rho_bin = int(rho / perp_tol_px)
+            rho_clusters.setdefault(rho_bin, []).append((i, p))
+
+        for cluster in rho_clusters.values():
+            if len(cluster) < min_dash_count:
+                continue
+
+            # Sort by position along the axis direction
+            along = [p['mx'] * cos_a + p['my'] * sin_a for _, p in cluster]
+            order = sorted(range(len(cluster)), key=lambda k: along[k])
+            sc = [cluster[k] for k in order]
+            sa = sorted(along)
+
+            dash_lens = [p['len'] for _, p in sc]
+            gaps = []
+            valid = True
+            for k in range(len(sc) - 1):
+                _, pk = sc[k]
+                _, pk1 = sc[k + 1]
+                end_k = sa[k] + pk['len'] / 2.0
+                start_k1 = sa[k + 1] - pk1['len'] / 2.0
+                gap = start_k1 - end_k
+                if gap < 0:      # overlapping — not a clean dash pattern
+                    valid = False
+                    break
+                gaps.append(gap)
+            if not valid or len(gaps) < min_dash_count - 1:
+                continue
+
+            da = np.array(dash_lens)
+            ga = np.array(gaps)
+            if da.mean() < 1e-9 or ga.mean() < 1e-9:
+                continue
+            if da.std() / da.mean() > cv_threshold:
+                continue
+            if ga.std() / ga.mean() > cv_threshold:
+                continue
+
+            group_segs = [(p['x1'], p['y1'], p['x2'], p['y2']) for _, p in sc]
+            dashed_groups.append(group_segs)
+            for i, _ in sc:
+                dash_indices.add(i)
+
+    solid = [seg for k, seg in enumerate(lines) if k not in dash_indices]
+    return solid, dashed_groups
+
+
 # ── vtracer: staircase removal, corner detection, splice-point segmentation ──
 
 def _remove_staircase(pts: np.ndarray, closed: bool = True) -> np.ndarray:
@@ -619,6 +897,15 @@ def extract_lines_and_contours(
     remove_staircase: bool = False,
     corner_threshold: float = 60.0,
     splice_threshold: float = 45.0,
+    # Scan2CAD-inspired post-processing
+    gap_jump: bool = False,
+    gap_px: float = 15.0,
+    fan_angle_deg: float = 20.0,
+    orthogonalize: bool = False,
+    ortho_base_angle: float = 0.0,
+    ortho_accuracy_deg: float = 2.0,
+    detect_dashes: bool = False,
+    max_dash_len_px: float = 40.0,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
@@ -682,13 +969,35 @@ def extract_lines_and_contours(
                        the splice-point detector.  Prevents any single fitted
                        arc from spanning more than this many degrees of
                        curvature.  Default 45°.  (vtracer: splice_threshold.)
+        gap_jump:      Close pixel-level breaks between nearly-touching line
+                       endpoints.  Adds synthetic bridge segments for pairs
+                       within gap_px whose directions are within fan_angle_deg.
+                       Most useful on scanned drawings with faded ink or
+                       scanner dropout.  (Scan2CAD: gap_jump.)
+        gap_px:        Maximum gap distance to bridge (pixels).  Default 15.
+        fan_angle_deg: Half-angle of the gap-jump directional search cone.
+                       Prevents bridging genuine corners.  Default 20°.
+        orthogonalize: Snap lines within ortho_accuracy_deg of horizontal or
+                       vertical to exact H/V.  Eliminates small angular errors
+                       from scanner tilt and improves downstream CAD usability.
+                       (Scan2CAD: orthogonal_snap.)
+        ortho_base_angle: Primary axis for orthogonalization (degrees, default 0°).
+        ortho_accuracy_deg: Angular snap tolerance for orthogonalization (default 2°).
+        detect_dashes: Identify runs of short collinear segments forming dashed
+                       or hidden-line patterns and divert them into a separate
+                       dashed_lines list rather than the main lines output.
+                       (Scan2CAD: dash_line_identification.)
+        max_dash_len_px: Maximum segment length (px) to be a dash candidate
+                       for the dashed-line detector.  Default 40 px.
 
     Returns:
         (lines, contours)              when return_arcs is False
         (lines, contours, arcs)        when return_arcs is True
+        (lines, contours, arcs, dashes) when return_arcs is True and detect_dashes is True
         lines    : list of (x1, y1, x2, y2) int tuples — straight segments.
         contours : list of np.ndarray shape (N, 2) — polyline vertex arrays.
         arcs     : list of dicts — {"type":"circle"|"arc", ...} primitives.
+        dashes   : list of lists of (x1,y1,x2,y2) — dashed segment groups.
     """
     if mode == "skeleton":
         warnings.warn(
@@ -838,8 +1147,28 @@ def extract_lines_and_contours(
     if snap_radius > 0 and lines:
         lines = _snap_endpoints(lines, radius=snap_radius)
 
+    # ── Step 8: Scan2CAD post-processing passes ───────────────────────────────
+    # Gap-jump: bridge pixel breaks in line segments.
+    if gap_jump and lines:
+        lines = _gap_jump(lines, gap_px=gap_px, fan_deg=fan_angle_deg)
+
+    # Orthogonalization: snap near-H/V lines to exact orthogonal angles.
+    if orthogonalize and lines:
+        lines = _orthogonalize(lines,
+                               base_angle_deg=ortho_base_angle,
+                               accuracy_deg=ortho_accuracy_deg)
+
+    # Dashed-line detection: extract periodic short-segment runs.
+    dashed_lines: list[list] = []
+    if detect_dashes and lines:
+        lines, dashed_lines = _detect_dashed_lines(
+            lines, max_dash_len_px=max_dash_len_px,
+        )
+
     if return_arcs:
         arcs = _dedup_circles(arcs)
+        if detect_dashes:
+            return lines, contours, arcs, dashed_lines
         return lines, contours, arcs
     return lines, contours
 

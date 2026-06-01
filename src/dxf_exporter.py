@@ -33,7 +33,11 @@ _LAYERS = [
     ("ELONGATED",        6),   # magenta     — dash / elongated-char candidates
     ("TEXT_CANDIDATES",  2),   # yellow      — text-string blobs
     ("NOISE_REJECTED",   8),   # dark grey   — below noise threshold
+    ("DASHED",           1),   # red         — detected dashed / hidden lines
 ]
+
+# Standard DXF DASHED linetype pattern (dash=0.5, gap=0.25 drawing units)
+_DASHED_PATTERN = [0.5, -0.25]
 
 
 def _circumcircle_3pts(
@@ -107,6 +111,7 @@ def export_to_dxf(
     line_weights: list | None = None,
     contour_weights: list | None = None,
     elongated_contours: list | None = None,
+    dashed_lines: list | None = None,
 ) -> int:
     """Export detected geometry to a DXF file.
 
@@ -137,6 +142,10 @@ def export_to_dxf(
         line_weights: DXF lineweight integers per line (1/100 mm).
         contour_weights: DXF lineweight integers per contour.
         elongated_contours: Contours from the elongated/dash-candidate mask.
+        dashed_lines: List of dashed groups from _detect_dashed_lines().
+            Each group is a list of (x1,y1,x2,y2) dash segments sorted along
+            the dashed-line axis.  Emitted as a single LINE entity spanning
+            the full group extent, on the DASHED layer with a DASHED linetype.
 
     Returns:
         Total number of DXF entities written.
@@ -154,6 +163,12 @@ def export_to_dxf(
 
     for name, colour in _LAYERS:
         doc.layers.add(name, color=colour)
+
+    # Register the DASHED linetype so entities on the DASHED layer render
+    # with the correct dash pattern in compliant DXF viewers.
+    if "DASHED" not in doc.linetypes:
+        doc.linetypes.add("DASHED", pattern=_DASHED_PATTERN,
+                          description="Dashed ____ ____ ____")
 
     def px(x: float, y: float) -> tuple[float, float]:
         return x * scale, (image_height - y) * scale
@@ -222,6 +237,21 @@ def export_to_dxf(
         if len(pts) >= 2:
             msp.add_lwpolyline(pts, dxfattribs={"layer": "ELONGATED"})
             entity_count += 1
+
+    # ── Dashed / hidden lines (Scan2CAD dash_line_identification) ────────────
+    for group in (dashed_lines or []):
+        if len(group) < 1:
+            continue
+        # Emit one LINE entity spanning the full group extent.
+        # The DASHED linetype carries the visual dash pattern.
+        first, last = group[0], group[-1]
+        x1, y1 = px(float(first[0]), float(first[1]))
+        x2, y2 = px(float(last[2]),  float(last[3]))
+        msp.add_line(
+            (x1, y1), (x2, y2),
+            dxfattribs={"layer": "DASHED", "linetype": "DASHED"},
+        )
+        entity_count += 1
 
     # ── Text candidates ───────────────────────────────────────────────────────
     for tc in (text_mask_contours or []):

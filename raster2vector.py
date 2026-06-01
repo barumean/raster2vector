@@ -140,6 +140,37 @@ def build_parser() -> argparse.ArgumentParser:
                           "detection (degrees). Prevents a single fitted arc from "
                           "spanning more than this arc angle. Default 45°. "
                           "(vtracer: splice_threshold)")
+    vec.add_argument("--gap-jump", action="store_true",
+                     help="Bridge pixel-level breaks between nearly-touching line "
+                          "endpoints. Adds synthetic connector segments for pairs "
+                          "within --gap-px whose directions align within --fan-angle. "
+                          "Dramatically reduces disconnected segments in scanned "
+                          "drawings with faded ink. (Scan2CAD: gap_jump)")
+    vec.add_argument("--gap-px", type=float, default=15.0, metavar="PX",
+                     help="Maximum gap distance to bridge with gap-jump (pixels, "
+                          "default 15). Try 10–25 at 300 dpi.")
+    vec.add_argument("--fan-angle", type=float, default=20.0, metavar="DEG",
+                     help="Half-angle of gap-jump directional search cone (degrees, "
+                          "default 20°). Prevents bridging genuine T/L corners.")
+    vec.add_argument("--orthogonalize", action="store_true",
+                     help="Snap lines within --ortho-accuracy of horizontal or "
+                          "vertical to exact H/V. Eliminates small scanner-tilt "
+                          "angle errors that break CAD trim/fill operations. "
+                          "(Scan2CAD: orthogonal_snap)")
+    vec.add_argument("--ortho-accuracy", type=float, default=2.0, metavar="DEG",
+                     help="Angular tolerance for orthogonalization snap (degrees, "
+                          "default 2°). (Scan2CAD: accuracy)")
+    vec.add_argument("--ortho-base-angle", type=float, default=0.0, metavar="DEG",
+                     help="Primary axis angle for orthogonalization (default 0° = "
+                          "horizontal). Use with --deskew for non-standard drawings.")
+    vec.add_argument("--detect-dashes", action="store_true",
+                     help="Identify runs of collinear short segments forming dashed "
+                          "or hidden-line patterns and emit them on a separate DASHED "
+                          "layer with the DXF DASHED linetype. "
+                          "(Scan2CAD: dash_line_identification)")
+    vec.add_argument("--max-dash-len", type=float, default=40.0, metavar="PX",
+                     help="Maximum segment length (pixels) to consider as a dash "
+                          "candidate for dashed-line detection (default 40).")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -271,7 +302,8 @@ def main(argv=None) -> int:
                   f"Elongated: {len(elongated_contours)} blobs")
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
-    lines, contours, arcs = extract_lines_and_contours(
+    dashed_lines: list = []
+    _vec_result = extract_lines_and_contours(
         binary,
         gray=gray,
         text_mask=text_mask_img,
@@ -297,10 +329,23 @@ def main(argv=None) -> int:
         remove_staircase=args.remove_staircase,
         corner_threshold=args.corner_threshold,
         splice_threshold=args.splice_threshold,
+        gap_jump=args.gap_jump,
+        gap_px=args.gap_px,
+        fan_angle_deg=args.fan_angle,
+        orthogonalize=args.orthogonalize,
+        ortho_base_angle=args.ortho_base_angle,
+        ortho_accuracy_deg=args.ortho_accuracy,
+        detect_dashes=args.detect_dashes,
+        max_dash_len_px=args.max_dash_len,
     )
+    if args.detect_dashes:
+        lines, contours, arcs, dashed_lines = _vec_result
+    else:
+        lines, contours, arcs = _vec_result
 
     if args.verbose:
-        print(f"Lines: {len(lines)}  Contours: {len(contours)}  Arcs: {len(arcs)}")
+        print(f"Lines: {len(lines)}  Contours: {len(contours)}  "
+              f"Arcs: {len(arcs)}  Dashes: {len(dashed_lines)}")
 
     # ── 3b. Stroke-width estimation (SPV) ──────────────────────────────────────
     line_weights: Optional[list] = None
@@ -331,6 +376,7 @@ def main(argv=None) -> int:
             arcs=arcs,
             line_weights=line_weights,
             contour_weights=contour_weights,
+            dashed_lines=dashed_lines,
         )
     except (OSError, IOError) as exc:
         print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)
