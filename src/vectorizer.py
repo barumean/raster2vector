@@ -887,10 +887,12 @@ def extract_lines_and_contours(
     # Arc / circle detection (DXF Section 5)
     detect_arcs: bool = True,
     arc_tol: Optional[float] = None,
+    min_arc_radius_px: float = 0.0,
     return_arcs: bool = False,
     # Legacy / advanced
     mode: str = "edge",
     merge_lines: bool = True,
+    dedup_lines: bool = True,
     snap_radius: float = 4.0,
     pre_close_kernel: int = 0,
     # Right-angle corner enhancement (imagetracerjs §internodes)
@@ -1044,6 +1046,7 @@ def extract_lines_and_contours(
     arcs: list = []
     contour_mask = np.zeros_like(thin_edges)
     arc_tolerance = arc_tol if arc_tol is not None else max(2.0, image_diag * 0.005)
+    _min_arc_r = max(3.0, min_arc_radius_px)
 
     for c in filtered:
         # ── Staircase removal (vtracer) before DP ────────────────────────────
@@ -1072,7 +1075,8 @@ def extract_lines_and_contours(
             lines.append((int(pts[0, 0]), int(pts[0, 1]),
                           int(pts[-1, 0]), int(pts[-1, 1])))
         elif return_arcs and detect_arcs and (
-            arc := _try_fit_arc(c, closed, arc_tolerance, image_diag=image_diag)
+            arc := _try_fit_arc(c, closed, arc_tolerance,
+                                min_radius=_min_arc_r, image_diag=image_diag)
         ):
             # Curved contour that fits a circle/arc → compact CAD primitive
             arcs.append(arc)
@@ -1098,7 +1102,8 @@ def extract_lines_and_contours(
                         extracted_any = True
                     else:
                         seg_arc = _try_fit_arc(
-                            seg, False, arc_tolerance, image_diag=image_diag
+                            seg, False, arc_tolerance,
+                            min_radius=_min_arc_r, image_diag=image_diag
                         )
                         if seg_arc:
                             arcs.append(seg_arc)
@@ -1145,6 +1150,13 @@ def extract_lines_and_contours(
         if merge_lines and hough_lines:
             hough_lines = _merge_collinear_lines(hough_lines)
         lines.extend(hough_lines)
+
+    # ── Step 6b: Deduplicate near-parallel overlapping lines ─────────────────
+    # Thick drawn lines produce two near-parallel traces (inner+outer edge of
+    # the stroke).  Collapse lines within 4 px perpendicular and 0 px gap.
+    if dedup_lines and lines:
+        lines = _merge_collinear_lines(lines, angle_tol_deg=2.0,
+                                       perp_tol=4.0, gap_tol=0.0)
 
     # ── Step 7: Snap near-touching line endpoints ────────────────────────────
     if snap_radius > 0 and lines:

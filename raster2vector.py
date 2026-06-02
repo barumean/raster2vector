@@ -91,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--arc-tol", type=float, default=None, metavar="F",
                      help="Max RMS pixel residual for circle/arc fitting "
                           "(default: auto, 0.5%% of image diagonal)")
+    vec.add_argument("--min-arc-radius", type=float, default=0.0, metavar="PX",
+                     help="Minimum arc/circle radius in pixels; smaller fits are "
+                          "discarded (useful to suppress text-character arcs, "
+                          "e.g. --min-arc-radius 15)")
+    vec.add_argument("--no-dedup-lines", action="store_true",
+                     help="Disable near-duplicate line removal (keeps doubled lines "
+                          "from thick strokes)")
     vec.add_argument("--min-line-length", type=int, default=80, metavar="PX",
                      help="Minimum Hough line segment length (supplemental only)")
     vec.add_argument("--max-gap", type=int, default=15, metavar="PX",
@@ -319,9 +326,11 @@ def main(argv=None) -> int:
         canny_high=args.canny_high,
         detect_arcs=not args.no_arcs,
         arc_tol=args.arc_tol,
+        min_arc_radius_px=args.min_arc_radius,
         return_arcs=True,
         mode=args.mode,
         merge_lines=not args.no_merge_lines,
+        dedup_lines=not args.no_dedup_lines,
         snap_radius=args.snap_radius,
         pre_close_kernel=args.pre_close_kernel,
         right_angle_enhance=args.right_angle_enhance,
