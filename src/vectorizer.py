@@ -1200,6 +1200,10 @@ def extract_lines_and_contours(
     consolidate: bool = False,
     consolidate_perp_tol: float = 6.0,
     consolidate_angle_tol: float = 4.0,
+    # Structural cleanup (reserved, not yet implemented — accepted for forward compat)
+    structure_cleanup: bool = False,
+    structure_line_tolerance: float = 2.0,
+    quad_detection: bool = True,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
