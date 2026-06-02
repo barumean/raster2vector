@@ -11,7 +11,7 @@ import numpy as np
 
 from src.preprocessor import load_and_preprocess
 from src.text_separator import separate_text_and_graphics
-from src.vectorizer import extract_lines_and_contours
+from src.vectorizer import extract_lines_and_contours, compute_page_border
 from src.dxf_exporter import export_to_dxf
 from src.stroke_width import estimate_line_widths, estimate_contour_widths
 
@@ -31,9 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
     pre = p.add_argument_group("preprocessing")
-    pre.add_argument("--threshold-method", choices=["otsu", "adaptive"],
+    pre.add_argument("--threshold-method", choices=["otsu", "adaptive", "sauvola"],
                      default="otsu", metavar="METHOD",
-                     help="Binarisation method: otsu or adaptive")
+                     help="Binarisation method: otsu, adaptive, or sauvola. "
+                          "sauvola (Sauvola 1999) is best for scanned drawings "
+                          "with uneven illumination or fold shadows.")
     pre.add_argument("--threshold", type=int, default=None, metavar="0-255",
                      help="Manual threshold value; overrides --threshold-method")
     pre.add_argument("--invert", action="store_true",
@@ -50,6 +52,22 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Block size for adaptive thresholding (auto-clamped odd ≥ 3)")
     pre.add_argument("--adaptive-c", type=int, default=9, metavar="N",
                      help="Constant subtracted from mean in adaptive thresholding")
+    pre.add_argument("--sauvola-window", type=int, default=25, metavar="N",
+                     help="Local window size for Sauvola thresholding (≈ stroke size)")
+    pre.add_argument("--sauvola-k", type=float, default=0.2, metavar="F",
+                     help="Sauvola k parameter (0.2–0.5; lower → more foreground)")
+    pre.add_argument("--deskew", action="store_true",
+                     help="Auto-correct rotational skew before binarisation using "
+                          "the dominant angle of horizontal line blobs")
+    pre.add_argument("--blur-radius", type=int, default=0, metavar="N",
+                     help="Edge-preserving Gaussian blur radius before thresholding "
+                          "(0=off). Reduces scanner noise / JPEG ringing while "
+                          "keeping hard edges sharp. Try 1–3 for scanned drawings. "
+                          "(imagetracerjs selective blur, blurradius)")
+    pre.add_argument("--blur-delta", type=int, default=20, metavar="N",
+                     help="Intensity delta threshold for selective blur: pixels "
+                          "where |original−blurred|>N are restored as edges. "
+                          "Default 20. (imagetracerjs blurdelta)")
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
@@ -80,6 +98,13 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--arc-tol", type=float, default=None, metavar="F",
                      help="Max RMS pixel residual for circle/arc fitting "
                           "(default: auto, 0.5%% of image diagonal)")
+    vec.add_argument("--min-arc-radius", type=float, default=0.0, metavar="PX",
+                     help="Minimum arc/circle radius in pixels; smaller fits are "
+                          "discarded (useful to suppress text-character arcs, "
+                          "e.g. --min-arc-radius 15)")
+    vec.add_argument("--no-dedup-lines", action="store_true",
+                     help="Disable near-duplicate line removal (keeps doubled lines "
+                          "from thick strokes)")
     vec.add_argument("--min-line-length", type=int, default=80, metavar="PX",
                      help="Minimum Hough line segment length (supplemental only)")
     vec.add_argument("--max-gap", type=int, default=15, metavar="PX",
@@ -104,6 +129,78 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--stroke-width", action="store_true",
                      help="Estimate stroke width per entity (SPV) and write DXF "
                           "lineweights so dimension lines vs. boundary lines differ")
+    vec.add_argument("--right-angle-enhance", action="store_true",
+                     help="Snap near-90° corners to exact right angles after "
+                          "simplification. Improves output for architectural and "
+                          "mechanical drawings with orthogonal geometry. "
+                          "(imagetracerjs rightangleenhance)")
+    vec.add_argument("--right-angle-tol", type=float, default=10.0, metavar="DEG",
+                     help="Tolerance in degrees around 90° for right-angle snapping "
+                          "(default 10°)")
+    vec.add_argument("--remove-staircase", action="store_true",
+                     help="Remove 1-pixel 45° staircase artefacts from raw contour "
+                          "points before Douglas-Peucker simplification. Useful on "
+                          "low-DPI scans with heavy pixel aliasing. "
+                          "(vtracer: remove_staircase)")
+    vec.add_argument("--corner-threshold", type=float, default=60.0, metavar="DEG",
+                     help="Turn-angle threshold (degrees) for corner detection used "
+                          "in segmented arc extraction. When a contour cannot be "
+                          "fitted as a single arc, it is split at corners and "
+                          "curvature inflections and arc fitting is re-attempted "
+                          "per segment. Set to 0 to disable. Default 60°. "
+                          "(vtracer: corner_threshold)")
+    vec.add_argument("--splice-threshold", type=float, default=45.0, metavar="DEG",
+                     help="Maximum angular span per arc segment for splice-point "
+                          "detection (degrees). Prevents a single fitted arc from "
+                          "spanning more than this arc angle. Default 45°. "
+                          "(vtracer: splice_threshold)")
+    vec.add_argument("--gap-jump", action="store_true",
+                     help="Bridge pixel-level breaks between nearly-touching line "
+                          "endpoints. Adds synthetic connector segments for pairs "
+                          "within --gap-px whose directions align within --fan-angle. "
+                          "Dramatically reduces disconnected segments in scanned "
+                          "drawings with faded ink. (Scan2CAD: gap_jump)")
+    vec.add_argument("--gap-px", type=float, default=15.0, metavar="PX",
+                     help="Maximum gap distance to bridge with gap-jump (pixels, "
+                          "default 15). Try 10–25 at 300 dpi.")
+    vec.add_argument("--fan-angle", type=float, default=20.0, metavar="DEG",
+                     help="Half-angle of gap-jump directional search cone (degrees, "
+                          "default 20°). Prevents bridging genuine T/L corners.")
+    vec.add_argument("--orthogonalize", action="store_true",
+                     help="Snap lines within --ortho-accuracy of horizontal or "
+                          "vertical to exact H/V. Eliminates small scanner-tilt "
+                          "angle errors that break CAD trim/fill operations. "
+                          "(Scan2CAD: orthogonal_snap)")
+    vec.add_argument("--ortho-accuracy", type=float, default=2.0, metavar="DEG",
+                     help="Angular tolerance for orthogonalization snap (degrees, "
+                          "default 2°). (Scan2CAD: accuracy)")
+    vec.add_argument("--ortho-base-angle", type=float, default=0.0, metavar="DEG",
+                     help="Primary axis angle for orthogonalization (default 0° = "
+                          "horizontal). Use with --deskew for non-standard drawings.")
+    vec.add_argument("--detect-dashes", action="store_true",
+                     help="Identify runs of collinear short segments forming dashed "
+                          "or hidden-line patterns and emit them on a separate DASHED "
+                          "layer with the DXF DASHED linetype. "
+                          "(Scan2CAD: dash_line_identification)")
+    vec.add_argument("--max-dash-len", type=float, default=40.0, metavar="PX",
+                     help="Maximum segment length (pixels) to consider as a dash "
+                          "candidate for dashed-line detection (default 40).")
+    vec.add_argument("--no-detect-boxes", action="store_true",
+                     help="Disable rectangular closed-contour classification "
+                          "(keep all contours on the CONTOURS layer)")
+    vec.add_argument("--box-angle-tol", type=float, default=20.0, metavar="DEG",
+                     help="Max angle deviation from 0°/90° for a contour segment "
+                          "to be considered part of a rectangle (default 20°)")
+    vec.add_argument("--no-consolidate", action="store_true",
+                     help="Disable cross-contour segment consolidation "
+                          "(skip merging near-duplicate parallel segments)")
+    vec.add_argument("--consolidate-perp-tol", type=float, default=6.0, metavar="PX",
+                     help="Perpendicular distance tolerance for segment consolidation "
+                          "(default 6 px)")
+    vec.add_argument("--consolidate-angle-tol", type=float, default=4.0, metavar="DEG",
+                     help="Angle tolerance for segment consolidation (default 4°)")
+    vec.add_argument("--no-page-border", action="store_true",
+                     help="Do not emit the outermost bounding rectangle on the BOX layer")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -194,8 +291,13 @@ def main(argv=None) -> int:
             morph_kernel=args.morph_kernel,
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
+            sauvola_window_size=args.sauvola_window,
+            sauvola_k=args.sauvola_k,
             despeckle=not args.no_despeckle,
             min_speckle_area=args.min_speckle_area,
+            deskew=args.deskew,
+            blur_radius=args.blur_radius,
+            blur_delta=args.blur_delta,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -210,21 +312,31 @@ def main(argv=None) -> int:
 
     # ── 2. Text / graphics separation ─────────────────────────────────────────
     text_contours: list = []
+    elongated_contours: list = []
     text_mask_img: Optional[np.ndarray] = None
 
     if args.text_separation:
-        text_mask_img, _ = separate_text_and_graphics(binary)
+        text_mask_img, _, elong_mask = separate_text_and_graphics(binary)
         raw_tc, _ = cv2.findContours(text_mask_img, cv2.RETR_EXTERNAL,
                                      cv2.CHAIN_APPROX_SIMPLE)
         for c in raw_tc:
             sq = c.squeeze()
             if sq.ndim == 2 and len(sq) >= 2:
                 text_contours.append(sq)
+        raw_el, _ = cv2.findContours(elong_mask, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
+        for c in raw_el:
+            sq = c.squeeze()
+            if sq.ndim == 2 and len(sq) >= 2:
+                elongated_contours.append(sq)
         if args.verbose:
-            print(f"Text candidates: {len(text_contours)} blobs")
+            print(f"Text candidates: {len(text_contours)} blobs  "
+                  f"Elongated: {len(elongated_contours)} blobs")
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
-    lines, contours, arcs = extract_lines_and_contours(
+    dashed_lines: list = []
+    box_contours: list = []
+    _vec_result = extract_lines_and_contours(
         binary,
         gray=gray,
         text_mask=text_mask_img,
@@ -240,25 +352,59 @@ def main(argv=None) -> int:
         canny_high=args.canny_high,
         detect_arcs=not args.no_arcs,
         arc_tol=args.arc_tol,
+        min_arc_radius_px=args.min_arc_radius,
         return_arcs=True,
         mode=args.mode,
         merge_lines=not args.no_merge_lines,
+        dedup_lines=not args.no_dedup_lines,
         snap_radius=args.snap_radius,
         pre_close_kernel=args.pre_close_kernel,
-        structure_cleanup=args.structure_cleanup,
-        structure_line_tolerance=args.structure_line_tolerance,
-        quad_detection=not args.no_quad_detection,
+        right_angle_enhance=args.right_angle_enhance,
+        right_angle_tol=args.right_angle_tol,
+        remove_staircase=args.remove_staircase,
+        corner_threshold=args.corner_threshold,
+        splice_threshold=args.splice_threshold,
+        gap_jump=args.gap_jump,
+        gap_px=args.gap_px,
+        fan_angle_deg=args.fan_angle,
+        orthogonalize=args.orthogonalize,
+        ortho_base_angle=args.ortho_base_angle,
+        ortho_accuracy_deg=args.ortho_accuracy,
+        detect_dashes=args.detect_dashes,
+        max_dash_len_px=args.max_dash_len,
+        detect_boxes=not args.no_detect_boxes,
+        box_angle_tol=args.box_angle_tol,
+        consolidate=not args.no_consolidate,
+        consolidate_perp_tol=args.consolidate_perp_tol,
+        consolidate_angle_tol=args.consolidate_angle_tol,
     )
+    _detect_boxes = not args.no_detect_boxes
+    if args.detect_dashes and _detect_boxes:
+        lines, contours, arcs, dashed_lines, box_contours = _vec_result
+    elif args.detect_dashes:
+        lines, contours, arcs, dashed_lines = _vec_result
+    elif _detect_boxes:
+        lines, contours, arcs, box_contours = _vec_result
+    else:
+        lines, contours, arcs = _vec_result
 
     if args.verbose:
-        print(f"Lines: {len(lines)}  Contours: {len(contours)}  Arcs: {len(arcs)}")
+        print(f"Lines: {len(lines)}  Contours: {len(contours)}  "
+              f"Arcs: {len(arcs)}  Dashes: {len(dashed_lines)}  "
+              f"Boxes: {len(box_contours)}")
 
     # ── 3b. Stroke-width estimation (SPV) ──────────────────────────────────────
     line_weights: Optional[list] = None
     contour_weights: Optional[list] = None
     if args.stroke_width:
-        line_weights = estimate_line_widths(binary, lines, dpi=args.dpi)
-        contour_weights = estimate_contour_widths(binary, contours, dpi=args.dpi)
+        # Build the medial_axis width map once and reuse for both lines and
+        # contours; this avoids computing it twice inside each estimate_* call.
+        from src.stroke_width import _build_width_map
+        width_map = _build_width_map(binary)
+        line_weights = estimate_line_widths(binary, lines, dpi=args.dpi,
+                                            width_map=width_map)
+        contour_weights = estimate_contour_widths(binary, contours, dpi=args.dpi,
+                                                  width_map=width_map)
         if args.verbose:
             from collections import Counter
             lw_counts = Counter(line_weights)
@@ -272,9 +418,13 @@ def main(argv=None) -> int:
             dpi=args.dpi,
             units_mm=True,
             text_mask_contours=text_contours,
+            elongated_contours=elongated_contours,
             arcs=arcs,
             line_weights=line_weights,
             contour_weights=contour_weights,
+            dashed_lines=dashed_lines,
+            box_contours=box_contours,
+            page_border=compute_page_border(lines, contours) if not args.no_page_border else None,
         )
     except (OSError, IOError) as exc:
         print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)
