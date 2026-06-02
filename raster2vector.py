@@ -84,6 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--max-line-deviation", type=float, default=2.0, metavar="F",
                      help="Max perpendicular deviation (px) to classify a simplified "
                           "contour as a straight LINE vs. LWPOLYLINE")
+    vec.add_argument("--structure-cleanup", action="store_true",
+                     help="Clean structure-like straight edges without forcing "
+                          "horizontal/vertical angles")
+    vec.add_argument("--structure-line-tolerance", type=float, default=2.5, metavar="F",
+                     help="Pixel tolerance for weak structural cleanup")
+    vec.add_argument("--no-quad-detection", action="store_true",
+                     help="Disable closed four-sided contour cleanup")
     vec.add_argument("--no-hough", action="store_true",
                      help="Disable supplemental Hough line detection")
     vec.add_argument("--no-arcs", action="store_true",
@@ -258,6 +265,8 @@ def main(argv=None) -> int:
         parser.error("--morph-kernel must be >= 1.")
     if args.approx_epsilon is not None and args.approx_epsilon <= 0:
         parser.error("--approx-epsilon must be positive.")
+    if args.structure_line_tolerance <= 0:
+        parser.error("--structure-line-tolerance must be positive.")
     if args.adaptive_block_size < 3:
         parser.error("--adaptive-block-size must be >= 3.")
     if args.min_speckle_area < 0:

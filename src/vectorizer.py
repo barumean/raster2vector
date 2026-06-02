@@ -1230,6 +1230,12 @@ def extract_lines_and_contours(
         merge_lines  : Merge collinear Hough fragments.
         snap_radius  : Endpoint snap distance (px).  0 = disabled.
         pre_close_kernel: Closing before edge detection (0 = off).
+        structure_cleanup: Weak structural cleanup for drawings dominated by
+                       straight structure edges.  Preserves diagonal angles.
+        structure_line_tolerance: Pixel tolerance used to remove small
+                       near-collinear wiggles and detect clean quadrilaterals.
+        quad_detection: When structure cleanup is enabled, simplify closed
+                       four-sided contours to clean quadrilaterals.
 
         detect_arcs  : Try to model curved contours as circles/arcs.
         arc_tol      : Max RMS pixel residual for a circle fit.  None = auto
@@ -1358,6 +1364,12 @@ def extract_lines_and_contours(
             pts = _snap_right_angles(pts, tol_deg=right_angle_tol)
 
         closed = _is_closed(c, tol_px=max(4.0, eps * 2))
+        if structure_cleanup:
+            pts = _structure_cleanup_polyline(
+                c, pts, closed, structure_line_tolerance, quad_detection
+            )
+            if len(pts) < 2:
+                continue
 
         if _is_straight(pts, max_line_deviation):
             # Entire simplified contour is straight → LINE entity

@@ -185,18 +185,46 @@ def test_polarity_normalization_black_on_white(tmp_path):
 
 
 def test_skeleton_no_page_border_black_on_white(tmp_path):
-    """Skeleton mode must trace the actual stroke, not the page border."""
+    """Deprecated skeleton alias must not revive page-border artefacts."""
     img = np.full((120, 120), 255, dtype=np.uint8)
     cv2.line(img, (10, 60), (110, 60), 0, 2)
     path = str(tmp_path / "bow.png")
     cv2.imwrite(path, img)
     _, _gray, binary = load_and_preprocess(path)
-    lines, contours = extract_lines_and_contours(binary, min_line_length=30,
-                                                 mode="skeleton")
-    # All detected geometry should sit near y≈60, never on the page edges (0/119).
+    with pytest.warns(DeprecationWarning):
+        lines, contours = extract_lines_and_contours(binary, min_line_length=30,
+                                                     mode="skeleton")
+    # Detected geometry may be a contour; it must not sit on page edges (0/119).
     all_y = [y for (_, y1, _, y2) in lines for y in (y1, y2)]
-    assert all_y, "skeleton mode found nothing"
+    all_y += [int(pt[1]) for c in contours for pt in c]
+    assert all_y, "deprecated skeleton alias found nothing"
     assert all(40 <= y <= 80 for y in all_y), f"page-border artefact detected: {all_y}"
+
+
+def test_structure_cleanup_preserves_diagonal_angle():
+    """Weak cleanup removes diagonal wiggle without snapping it horizontal."""
+    pts = np.array([[0, 0], [20, 3], [40, 6], [60, 9], [80, 12]], dtype=np.int32)
+    contour = pts.reshape(-1, 1, 2)
+    cleaned = _structure_cleanup_polyline(
+        contour, pts, closed=False, line_tolerance=2.5, quad_detection=True
+    )
+    assert len(cleaned) == 2
+    assert cleaned[0].tolist() == [0, 0]
+    assert cleaned[-1].tolist() == [80, 12]
+    assert cleaned[-1][1] != cleaned[0][1], "diagonal was flattened"
+
+
+def test_structure_cleanup_detects_quadrilateral_not_only_rectangle():
+    """Closed four-sided slanted structures are kept as clean quadrilaterals."""
+    pts = np.array([[10, 10], [90, 20], [80, 70], [20, 60], [10, 10]], dtype=np.int32)
+    contour = pts.reshape(-1, 1, 2)
+    cleaned = _structure_cleanup_polyline(
+        contour, pts, closed=True, line_tolerance=3.0, quad_detection=True
+    )
+    assert len(cleaned) == 5
+    assert np.array_equal(cleaned[0], cleaned[-1])
+    # The first edge is intentionally slanted and must remain so.
+    assert cleaned[0][1] != cleaned[1][1]
 
 
 def test_merge_keeps_parallel_lines():
