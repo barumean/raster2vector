@@ -1263,6 +1263,12 @@ def extract_lines_and_contours(
     structure_cleanup: bool = False,
     structure_line_tolerance: float = 2.0,
     quad_detection: bool = True,
+    # Text-arc suppression: tag text-character arc clusters for a separate layer
+    suppress_text_arcs: bool = False,
+    text_arc_min_cluster: int = 3,
+    text_arc_r_tol: float = 0.4,
+    text_arc_y_tol: float = 1.5,
+    text_arc_x_gap: float = 4.0,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
@@ -1568,6 +1574,14 @@ def extract_lines_and_contours(
 
     if return_arcs:
         arcs = _dedup_circles(arcs)
+        if suppress_text_arcs:
+            arcs = _suppress_text_arcs(
+                arcs,
+                min_cluster=text_arc_min_cluster,
+                r_tol_ratio=text_arc_r_tol,
+                y_tol_ratio=text_arc_y_tol,
+                x_gap_ratio=text_arc_x_gap,
+            )
         if detect_dashes and detect_boxes:
             return lines, contours, arcs, dashed_lines, box_contours
         if detect_dashes:
@@ -1582,6 +1596,110 @@ def extract_lines_and_contours(
     if detect_boxes:
         return lines, contours, box_contours
     return lines, contours
+
+
+def _arc_center_radius(arc: dict) -> tuple[float, float, float] | None:
+    """Return (cx, cy, r) for any arc/circle dict, or None if uncomputable."""
+    if arc.get("type") == "circle":
+        cx, cy = arc["center"]
+        return float(cx), float(cy), float(arc["r"])
+    if arc.get("type") == "arc":
+        pts = np.array([arc["start"], arc["mid"], arc["end"]], dtype=float)
+        cx, cy, r, resid = _fit_circle(pts)
+        if np.isfinite(r) and r > 1e-3:
+            return float(cx), float(cy), float(r)
+    return None
+
+
+def _suppress_text_arcs(
+    arcs: list,
+    min_cluster: int = 3,
+    r_tol_ratio: float = 0.4,
+    y_tol_ratio: float = 1.5,
+    x_gap_ratio: float = 6.0,
+) -> list:
+    """Tag arc/circle primitives that are likely text characters.
+
+    Text characters (O, C, G, parentheses …) appear as arcs of similar radius
+    arranged in a horizontal row.  This function detects such clusters and sets
+    ``arc["text_candidate"] = True`` on every member so the DXF exporter can
+    route them to a separate layer instead of ARCS.
+
+    Detection criteria (all must hold for a run to be classified as text):
+      - Radii within *r_tol_ratio* of the group median.
+      - Consecutive centres along X are within *x_gap_ratio × avg_r*.
+      - All centres in the run share a Y band of width *y_tol_ratio × avg_r*.
+      - The run contains ≥ *min_cluster* members.
+
+    Args:
+        arcs:          List of arc/circle dicts from extract_lines_and_contours.
+        min_cluster:   Minimum cluster size to trigger text classification.
+        r_tol_ratio:   Radius similarity tolerance (fraction of median r).
+        y_tol_ratio:   Vertical band half-width as a multiple of avg_r.
+        x_gap_ratio:   Maximum X gap between consecutive centres (× avg_r).
+
+    Returns:
+        The same list with ``text_candidate=True`` added to flagged entries.
+    """
+    if not arcs or min_cluster < 2:
+        return arcs
+
+    # ── Collect centre / radius for every primitive ──────────────────────────
+    props: list[tuple[float, float, float, int]] = []   # cx, cy, r, idx
+    for i, arc in enumerate(arcs):
+        cr = _arc_center_radius(arc)
+        if cr is not None:
+            props.append((cr[0], cr[1], cr[2], i))
+
+    if len(props) < min_cluster:
+        return arcs
+
+    text_indices: set[int] = set()
+
+    # ── Cluster by similar radius ─────────────────────────────────────────────
+    props_by_r = sorted(props, key=lambda p: p[2])
+    n = len(props_by_r)
+    gi = 0
+    while gi < n:
+        r_ref = props_by_r[gi][2]
+        gj = gi
+        while gj < n and abs(props_by_r[gj][2] - r_ref) / max(r_ref, 1.0) <= r_tol_ratio:
+            gj += 1
+        group = props_by_r[gi:gj]
+        gi = gj
+
+        if len(group) < min_cluster:
+            continue
+
+        avg_r = float(np.mean([p[2] for p in group]))
+        y_tol = y_tol_ratio * avg_r
+        x_max_gap = x_gap_ratio * avg_r
+
+        # Sort by X, then scan for horizontal runs
+        group_x = sorted(group, key=lambda p: p[0])
+        run_start = 0
+        for k in range(1, len(group_x) + 1):
+            end_of_input = k == len(group_x)
+            if not end_of_input:
+                cx_prev, cy_prev = group_x[k - 1][0], group_x[k - 1][1]
+                cx_curr, cy_curr = group_x[k][0], group_x[k][1]
+                x_gap = cx_curr - cx_prev
+                y_diff = abs(cy_curr - cy_prev)
+                still_in_run = x_gap <= x_max_gap and y_diff <= y_tol
+            else:
+                still_in_run = False
+
+            if not still_in_run:
+                run_len = k - run_start
+                if run_len >= min_cluster:
+                    for m in range(run_start, k):
+                        text_indices.add(group_x[m][3])
+                run_start = k
+
+    for i in text_indices:
+        arcs[i] = {**arcs[i], "text_candidate": True}
+
+    return arcs
 
 
 def _dedup_circles(arcs: list, center_tol: float = 5.0, r_tol: float = 5.0,
