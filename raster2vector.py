@@ -377,6 +377,9 @@ def main(argv=None) -> int:
         consolidate=not args.no_consolidate,
         consolidate_perp_tol=args.consolidate_perp_tol,
         consolidate_angle_tol=args.consolidate_angle_tol,
+        structure_cleanup=args.structure_cleanup,
+        structure_line_tolerance=args.structure_line_tolerance,
+        quad_detection=not args.no_quad_detection,
     )
     _detect_boxes = not args.no_detect_boxes
     if args.detect_dashes and _detect_boxes:
