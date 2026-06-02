@@ -27,7 +27,7 @@ import numpy as np
 
 # DXF layer definitions: (name, ACI colour)
 _LAYERS = [
-    ("LINES",            7),   # white/black — straight segments
+    ("LINES",            1),   # red         — straight segments
     ("CONTOURS",         3),   # green       — curved / complex polylines
     ("ARCS",             5),   # blue        — fitted circles / arcs
     ("ELONGATED",        6),   # magenta     — dash / elongated-char candidates
