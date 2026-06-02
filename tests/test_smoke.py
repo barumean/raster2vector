@@ -87,16 +87,27 @@ def test_full_pipeline(square_image_path, dxf_out):
 
 
 def test_skeleton_mode_deprecated_alias(square_image_path, dxf_out):
-    """mode='skeleton' is a deprecated alias: it warns and behaves like edge."""
+    """mode='skeleton' is a deprecated alias for centerline: warns and produces geometry."""
     original_bgr, gray, binary = load_and_preprocess(square_image_path)
     with pytest.warns(DeprecationWarning):
         skel = extract_lines_and_contours(binary, min_line_length=20,
                                           mode="skeleton")
-    edge = extract_lines_and_contours(binary, min_line_length=20, mode="edge")
-    # Deprecated alias must produce identical geometry to edge mode.
-    assert skel[0] == edge[0]
-    assert len(skel[1]) == len(edge[1])
+    # centerline mode produces some geometry (lines and/or contours)
+    assert len(skel[0]) + len(skel[1]) >= 1
     count = export_to_dxf(skel[0], skel[1], dxf_out, image_height=binary.shape[0])
+    assert count >= 1
+
+
+def test_centerline_mode(square_image_path, dxf_out):
+    """mode='centerline' produces geometry via medial_axis skeleton graph."""
+    _, _, binary = load_and_preprocess(square_image_path)
+    result = extract_lines_and_contours(
+        binary, min_line_length=20, mode="centerline", return_arcs=True
+    )
+    lines, contours, arcs = result
+    assert len(lines) + len(contours) >= 1, "centerline mode produced no geometry"
+    count = export_to_dxf(lines, contours, dxf_out, image_height=binary.shape[0],
+                          arcs=arcs)
     assert count >= 1
 
 

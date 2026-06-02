@@ -71,9 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Vectorisation ─────────────────────────────────────────────────────────
     vec = p.add_argument_group("vectorisation")
-    vec.add_argument("--mode", choices=["edge", "skeleton"], default="edge",
-                     help="edge (default): contour-first + Canny on grayscale; "
-                          "skeleton: deprecated, treated as edge")
+    vec.add_argument("--mode", choices=["edge", "centerline", "skeleton"],
+                     default="edge",
+                     help="edge (default): Canny edge contour tracing; "
+                          "centerline: medial_axis skeleton graph + RANSAC "
+                          "line/arc fitting — theoretically correct for CAD "
+                          "line drawings (Hilaire-Tombre 2006); "
+                          "skeleton: deprecated alias for centerline")
     vec.add_argument("--pre-close-kernel", type=int, default=0, metavar="N",
                      help="Morphological closing before edge detection to fill thick "
                           "stroke interiors. 0=off. Try 5-15 for thick drawings.")

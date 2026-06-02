@@ -38,6 +38,12 @@ try:
 except ImportError:
     _SKIMAGE = False
 
+try:
+    from skimage.morphology import medial_axis as _ski_medial
+    _SKIMAGE_MEDIAL = True
+except ImportError:
+    _SKIMAGE_MEDIAL = False
+
 
 # ── Thin edge images to 1 px ──────────────────────────────────────────────────
 
@@ -865,6 +871,311 @@ def _snap_endpoints(lines: list, radius: float = 4.0) -> list:
     return result
 
 
+# ── Centerline mode: skeleton graph extraction (Hilaire-Tombre §III) ─────────
+
+def _skeleton_graph(skel: np.ndarray) -> list[np.ndarray]:
+    """Extract ordered branch pixel-chains from a 1-px skeleton image.
+
+    Algorithm (sknw-style, no external dependency):
+    1.  Find junction pixels (8-neighbours ≥ 3) and endpoint pixels (= 1).
+    2.  Walk along 8-connected paths from each endpoint/junction stop-point,
+        collecting pixel coordinates until the next stop-point.
+    3.  Return each walk as an ordered (N, 2) array of (col, row) = (x, y).
+
+    Short branches (< 3 px) that are pure junction noise are discarded.
+
+    Args:
+        skel: Binary uint8 image, foreground = 255 (1-px skeleton).
+
+    Returns:
+        List of (N, 2) int32 arrays, each a branch pixel chain [x, y].
+    """
+    bw = (skel > 0).astype(np.uint8)
+    h, w = bw.shape
+
+    # Neighbour count per pixel
+    kernel = np.ones((3, 3), np.uint8)
+    kernel[1, 1] = 0
+    nc = cv2.filter2D(bw, -1, kernel) * bw  # count of foreground neighbours
+
+    # Junction: ≥ 3 neighbours.  Endpoint: 1 neighbour.
+    stops = (nc >= 3) | (nc == 1)
+    stop_set: set[tuple[int, int]] = set(
+        map(tuple, np.column_stack(np.where(stops)))
+    )  # (row, col)
+
+    visited_edges: set[frozenset] = set()
+    branches: list[np.ndarray] = []
+
+    # 8-connectivity offsets
+    _nbrs = [(-1, -1), (-1, 0), (-1, 1),
+             (0, -1),           (0, 1),
+             (1, -1),  (1, 0),  (1, 1)]
+
+    def _walk(r0: int, c0: int, r1: int, c1: int) -> list[tuple[int, int]]:
+        """Walk from (r0,c0) through (r1,c1) until next stop pixel."""
+        path = [(r0, c0), (r1, c1)]
+        pr, pc = r0, c0
+        cr, cc = r1, c1
+        while (cr, cc) not in stop_set:
+            found = False
+            for dr, dc in _nbrs:
+                nr, nc_ = cr + dr, cc + dc
+                if (0 <= nr < h and 0 <= nc_ < w
+                        and bw[nr, nc_]
+                        and (nr, nc_) != (pr, pc)):
+                    path.append((nr, nc_))
+                    pr, pc = cr, cc
+                    cr, cc = nr, nc_
+                    found = True
+                    break
+            if not found:
+                break
+        return path
+
+    for r0, c0 in stop_set:
+        for dr, dc in _nbrs:
+            r1, c1 = r0 + dr, c0 + dc
+            if not (0 <= r1 < h and 0 <= c1 < w and bw[r1, c1]):
+                continue
+            edge_key = frozenset([(r0, c0), (r1, c1)])
+            if edge_key in visited_edges:
+                continue
+            visited_edges.add(edge_key)
+            path = _walk(r0, c0, r1, c1)
+            if len(path) < 2:
+                continue
+            # Convert (row, col) → (x=col, y=row) for consistency with rest of pipeline
+            arr = np.array([(c, r) for r, c in path], dtype=np.int32)
+            branches.append(arr)
+
+    # ── Handle closed loops (no junctions/endpoints, e.g. rectangles, circles) ─
+    # If no stop pixels exist, every pixel has degree 2: a pure cycle.
+    # Walk the entire connected component starting from an arbitrary pixel.
+    if not stop_set:
+        visited_px: set[tuple[int, int]] = set()
+        foreground = list(map(tuple, np.column_stack(np.where(bw > 0))))
+        for seed_r, seed_c in foreground:
+            if (seed_r, seed_c) in visited_px:
+                continue
+            # BFS to collect the connected component
+            component: list[tuple[int, int]] = []
+            queue = [(seed_r, seed_c)]
+            visited_px.add((seed_r, seed_c))
+            while queue:
+                cr, cc = queue.pop(0)
+                component.append((cr, cc))
+                for dr, dc in _nbrs:
+                    nr, nc_ = cr + dr, cc + dc
+                    if (0 <= nr < h and 0 <= nc_ < w
+                            and bw[nr, nc_]
+                            and (nr, nc_) not in visited_px):
+                        visited_px.add((nr, nc_))
+                        queue.append((nr, nc_))
+            if len(component) < 2:
+                continue
+            # Walk component in order by following the 8-connected chain
+            ordered: list[tuple[int, int]] = [component[0]]
+            comp_set = set(component)
+            prev = (-1, -1)
+            cur = component[0]
+            while True:
+                found_next = False
+                for dr, dc in _nbrs:
+                    nr, nc_ = cur[0] + dr, cur[1] + dc
+                    nxt = (nr, nc_)
+                    if nxt in comp_set and nxt != prev and nxt != ordered[0]:
+                        ordered.append(nxt)
+                        prev, cur = cur, nxt
+                        found_next = True
+                        break
+                if not found_next:
+                    break
+            arr = np.array([(c, r) for r, c in ordered], dtype=np.int32)
+            branches.append(arr)
+
+    return branches
+
+
+def _ransac_line(pts: np.ndarray, inlier_tol: float = 2.0,
+                 max_iter: int = 40) -> tuple[bool, np.ndarray]:
+    """Fit a line to pts using RANSAC; return (is_line, simplified_pts).
+
+    Returns (True, two-point array) when the line model explains ≥ 70% of
+    points within inlier_tol.  Returns (False, pts) otherwise.
+    """
+    n = len(pts)
+    if n < 2:
+        return False, pts
+    if n == 2:
+        return True, pts
+
+    pts_f = pts.astype(float)
+    best_inliers = 0
+    rng = np.random.default_rng(0)
+
+    for _ in range(max_iter):
+        i, j = rng.choice(n, 2, replace=False)
+        p1, p2 = pts_f[i], pts_f[j]
+        d = p2 - p1
+        dn = math.hypot(d[0], d[1])
+        if dn < 1e-9:
+            continue
+        # Perpendicular distance from all pts to line p1-p2
+        cross = abs(d[0] * (pts_f[:, 1] - p1[1]) - d[1] * (pts_f[:, 0] - p1[0]))
+        dists = cross / dn
+        inliers = int((dists <= inlier_tol).sum())
+        if inliers > best_inliers:
+            best_inliers = inliers
+
+    if best_inliers / n >= 0.70:
+        return True, np.array([pts[0], pts[-1]], dtype=np.int32)
+    return False, pts
+
+
+def _ransac_arc(pts: np.ndarray, inlier_tol: float = 2.0,
+                max_iter: int = 40, min_r: float = 3.0,
+                image_diag: float = 1e9) -> tuple[bool, dict | None]:
+    """Fit a circular arc to pts using RANSAC.
+
+    Returns (True, arc_dict) when ≥ 65% of points are within inlier_tol of
+    the fitted circle.  arc_dict has the same schema as _try_fit_arc output.
+    """
+    n = len(pts)
+    if n < 5:
+        return False, None
+
+    pts_f = pts.astype(float)
+    best_inliers = 0
+    best_cx = best_cy = best_r = 0.0
+    rng = np.random.default_rng(1)
+
+    for _ in range(max_iter):
+        idx = rng.choice(n, 3, replace=False)
+        sample = pts_f[idx]
+        cx, cy, r, resid = _fit_circle(sample)
+        if not np.isfinite(r) or r < min_r or r > image_diag * 5:
+            continue
+        dists = np.abs(np.hypot(pts_f[:, 0] - cx, pts_f[:, 1] - cy) - r)
+        inliers = int((dists <= inlier_tol).sum())
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_cx, best_cy, best_r = cx, cy, r
+
+    if best_inliers / n < 0.65:
+        return False, None
+
+    # Build arc dict (same schema as _try_fit_arc)
+    inlier_mask = np.abs(
+        np.hypot(pts_f[:, 0] - best_cx, pts_f[:, 1] - best_cy) - best_r
+    ) <= inlier_tol
+    inlier_pts = pts_f[inlier_mask]
+
+    span = _angular_span(inlier_pts, best_cx, best_cy)
+    if span < np.deg2rad(20):
+        return False, None
+    if span >= np.deg2rad(300):
+        return True, {"type": "circle",
+                      "center": (best_cx, best_cy), "r": best_r}
+
+    ang = np.arctan2(inlier_pts[:, 1] - best_cy, inlier_pts[:, 0] - best_cx)
+    order = np.argsort(ang)
+    a_s = ang[order]
+    gaps = np.append(np.diff(a_s), (a_s[0] + 2 * np.pi) - a_s[-1])
+    g = int(np.argmax(gaps))
+    rot = np.concatenate([order[g + 1:], order[: g + 1]])
+    start = inlier_pts[rot[0]]
+    end = inlier_pts[rot[-1]]
+    mid = inlier_pts[rot[len(rot) // 2]]
+    if float(np.hypot(start[0] - end[0], start[1] - end[1])) < 3.0:
+        return False, None
+    return True, {
+        "type": "arc",
+        "start": (float(start[0]), float(start[1])),
+        "mid":   (float(mid[0]),   float(mid[1])),
+        "end":   (float(end[0]),   float(end[1])),
+    }
+
+
+def _centerline_extract(
+    binary: np.ndarray,
+    text_mask: Optional[np.ndarray],
+    max_line_deviation: float,
+    arc_tol: float,
+    min_arc_radius_px: float,
+    image_diag: float,
+    min_branch_px: int = 8,
+    ransac_tol: float = 2.0,
+) -> tuple[list, list, list]:
+    """Centerline-mode extraction via medial_axis skeleton graph.
+
+    Theoretical basis: Hilaire & Tombre (2006) §III — skeleton segmentation
+    into Fuzzy Segments (lines) and Fuzzy Circular Arcs via robust sampling.
+
+    Pipeline:
+    1.  medial_axis(binary) → 1-px true centerline skeleton.
+    2.  Suppress text-mask regions.
+    3.  _skeleton_graph() → branch pixel chains (junction-to-junction paths).
+    4.  For each branch: RANSAC line → if fail, RANSAC arc → else polyline.
+
+    Returns:
+        (lines, contours, arcs)  — same schema as the edge-mode pipeline.
+    """
+    if not _SKIMAGE_MEDIAL:
+        # Fallback: skimage.skeletonize on binary
+        skel_bool = _ski_skel(binary > 0) if _SKIMAGE else (binary > 0)
+        skel = (skel_bool.astype(np.uint8)) * 255
+    else:
+        skel_bool, _ = _ski_medial(binary > 0, return_distance=True)
+        skel = (skel_bool.astype(np.uint8)) * 255
+
+    if text_mask is not None:
+        dm = cv2.dilate(text_mask, np.ones((5, 5), np.uint8), iterations=1)
+        skel = cv2.bitwise_and(skel, cv2.bitwise_not(dm))
+
+    branches = _skeleton_graph(skel)
+
+    lines: list = []
+    contours: list = []
+    arcs: list = []
+
+    for pts in branches:
+        if len(pts) < 2:
+            continue
+
+        # ── RANSAC line fit ───────────────────────────────────────────────
+        is_line, simplified = _ransac_line(pts, inlier_tol=ransac_tol)
+        if is_line:
+            lines.append((int(simplified[0, 0]), int(simplified[0, 1]),
+                          int(simplified[1, 0]), int(simplified[1, 1])))
+            continue
+
+        # ── RANSAC arc fit ────────────────────────────────────────────────
+        is_arc, arc_dict = _ransac_arc(pts, inlier_tol=ransac_tol,
+                                       min_r=max(3.0, min_arc_radius_px),
+                                       image_diag=image_diag)
+        if is_arc and arc_dict is not None:
+            arcs.append(arc_dict)
+            continue
+
+        # ── Fallback: Douglas-Peucker polyline ───────────────────────────
+        dp_eps = max(1.5, image_diag * 0.003)
+        cv2_pts = pts.reshape(-1, 1, 2).astype(np.int32)
+        approx = cv2.approxPolyDP(cv2_pts, dp_eps, closed=False)
+        sq = approx.squeeze()
+        if sq.ndim == 1:
+            sq = sq.reshape(1, 2)
+        dp_pts = sq.astype(np.int32)
+        if len(dp_pts) >= 2:
+            if _is_straight(dp_pts, max_line_deviation):
+                lines.append((int(dp_pts[0, 0]), int(dp_pts[0, 1]),
+                              int(dp_pts[-1, 0]), int(dp_pts[-1, 1])))
+            else:
+                contours.append(dp_pts)
+
+    return lines, contours, arcs
+
+
 # ── Structure cleanup (stub — reserved for future implementation) ─────────────
 
 def _structure_cleanup_polyline(
@@ -1294,8 +1605,10 @@ def extract_lines_and_contours(
         hough_threshold: Accumulator threshold for HoughLinesP.
         use_hough    : Toggle supplemental Hough pass.
         canny_low / canny_high: Canny hysteresis thresholds.
-        mode         : 'edge' (default).  'skeleton' is deprecated and treated
-                       as 'edge' with a warning.
+        mode         : 'edge' (default) — Canny edge contour tracing.
+                       'centerline' — medial_axis skeleton graph + RANSAC
+                       line/arc fitting (Hilaire-Tombre 2006 pipeline).
+                       'skeleton' is deprecated and treated as 'centerline'.
         merge_lines  : Merge collinear Hough fragments.
         snap_radius  : Endpoint snap distance (px).  0 = disabled.
         pre_close_kernel: Closing before edge detection (0 = off).
@@ -1370,15 +1683,82 @@ def extract_lines_and_contours(
     """
     if mode == "skeleton":
         warnings.warn(
-            "--mode skeleton is deprecated; using edge mode instead. "
-            "Skeleton-based extraction is no longer recommended for drawing "
-            "reproduction because it loses stroke-width and shape context.",
+            "--mode skeleton is deprecated; using centerline mode instead.",
             DeprecationWarning, stacklevel=2,
         )
+        mode = "centerline"
 
     h, w = binary.shape[:2]
     image_diag = float(np.hypot(h, w))
     eps = approx_epsilon if approx_epsilon is not None else max(1.5, image_diag * 0.003)
+
+    # ── Centerline mode: medial_axis skeleton graph + RANSAC fitting ─────────
+    # Hilaire & Tombre (2006): true centerlines, one polyline per stroke,
+    # no doubled geometry from thick-stroke edges.
+    if mode == "centerline":
+        arc_tolerance = arc_tol if arc_tol is not None else max(2.0, image_diag * 0.005)
+        _min_arc_r = max(3.0, min_arc_radius_px)
+        lines, contours, arcs = _centerline_extract(
+            binary, text_mask,
+            max_line_deviation=max_line_deviation,
+            arc_tol=arc_tolerance,
+            min_arc_radius_px=_min_arc_r,
+            image_diag=image_diag,
+            ransac_tol=max_line_deviation,
+        )
+        # Shared post-processing (gap-jump, orthogonalize, dashes, boxes, …)
+        if snap_radius > 0 and lines:
+            lines = _snap_endpoints(lines, radius=snap_radius)
+        if gap_jump and lines:
+            lines = _gap_jump(lines, gap_px=gap_px, fan_deg=fan_angle_deg)
+        if orthogonalize and lines:
+            lines = _orthogonalize(lines,
+                                   base_angle_deg=ortho_base_angle,
+                                   accuracy_deg=ortho_accuracy_deg)
+        dashed_lines: list[list] = []
+        if detect_dashes and lines:
+            lines, dashed_lines = _detect_dashed_lines(
+                lines, max_dash_len_px=max_dash_len_px)
+        if consolidate and (lines or contours):
+            lines, contours = _consolidate_segments(
+                lines, contours,
+                angle_tol_deg=consolidate_angle_tol,
+                perp_tol_px=consolidate_perp_tol)
+        box_contours: list = []
+        if detect_boxes:
+            remaining: list = []
+            for pts in contours:
+                closed = bool(np.linalg.norm(
+                    pts[0].astype(float) - pts[-1].astype(float)) < 4.0)
+                if closed and _is_rectangular(pts, angle_tol_deg=box_angle_tol):
+                    box_contours.append(pts)
+                else:
+                    remaining.append(pts)
+            contours = remaining
+        if return_arcs:
+            arcs = _dedup_circles(arcs)
+            if suppress_text_arcs:
+                arcs = _suppress_text_arcs(
+                    arcs,
+                    min_cluster=text_arc_min_cluster,
+                    r_tol_ratio=text_arc_r_tol,
+                    y_tol_ratio=text_arc_y_tol,
+                    x_gap_ratio=text_arc_x_gap,
+                )
+            if detect_dashes and detect_boxes:
+                return lines, contours, arcs, dashed_lines, box_contours
+            if detect_dashes:
+                return lines, contours, arcs, dashed_lines
+            if detect_boxes:
+                return lines, contours, arcs, box_contours
+            return lines, contours, arcs
+        if detect_dashes and detect_boxes:
+            return lines, contours, dashed_lines, box_contours
+        if detect_dashes:
+            return lines, contours, dashed_lines
+        if detect_boxes:
+            return lines, contours, box_contours
+        return lines, contours
 
     # ── Step 1: Build 1-px edge image ────────────────────────────────────────
     # Canny runs on grayscale when available (preserves subtle tone boundaries),
