@@ -36,6 +36,7 @@ _LAYERS = [
     ("DASHED",           1),   # red         — detected dashed / hidden lines
     ("BOXES",            4),   # cyan        — detected rectangular closed regions
     ("BOX",              7),   # white/black — outermost drawing border
+    ("TEXT_ARCS",        2),   # yellow      — arc clusters classified as text characters
 ]
 
 # Standard DXF DASHED linetype pattern (dash=0.5, gap=0.25 drawing units)
@@ -200,11 +201,12 @@ def export_to_dxf(
 
     # ── Circles / arcs via ezdxf.math.arc_to_bulge ───────────────────────────
     for arc in (arcs or []):
+        arc_layer = "TEXT_ARCS" if arc.get("text_candidate") else "ARCS"
         if arc.get("type") == "circle":
             cx, cy = arc["center"]
             r = float(arc["r"])
             cxf, cyf = px(cx, cy)
-            msp.add_circle((cxf, cyf), r * scale, dxfattribs={"layer": "ARCS"})
+            msp.add_circle((cxf, cyf), r * scale, dxfattribs={"layer": arc_layer})
             entity_count += 1
 
         elif arc.get("type") == "arc":
@@ -229,7 +231,7 @@ def export_to_dxf(
                     [(start_pt.x, start_pt.y, 0.0, 0.0, bulge),
                      (end_pt.x, end_pt.y)],
                     format="xyseb",
-                    dxfattribs={"layer": "ARCS"},
+                    dxfattribs={"layer": arc_layer},
                 )
                 entity_count += 1
             except Exception:

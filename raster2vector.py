@@ -201,6 +201,22 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Angle tolerance for segment consolidation (default 4°)")
     vec.add_argument("--no-page-border", action="store_true",
                      help="Do not emit the outermost bounding rectangle on the BOX layer")
+    vec.add_argument("--suppress-text-arcs", action="store_true",
+                     help="Detect arc/circle clusters that look like text characters "
+                          "(similar size, horizontal row) and route them to the "
+                          "TEXT_ARCS layer instead of ARCS. Keeps engineering arcs "
+                          "clean when the drawing contains annotation text.")
+    vec.add_argument("--text-arc-min-cluster", type=int, default=3, metavar="N",
+                     help="Minimum arcs in a row to be classified as text (default 3)")
+    vec.add_argument("--text-arc-r-tol", type=float, default=0.4, metavar="F",
+                     help="Radius similarity tolerance for text-arc clustering "
+                          "(fraction of median radius, default 0.4)")
+    vec.add_argument("--text-arc-y-tol", type=float, default=1.5, metavar="F",
+                     help="Vertical band half-width for text-arc clustering "
+                          "(multiple of avg radius, default 1.5)")
+    vec.add_argument("--text-arc-x-gap", type=float, default=6.0, metavar="F",
+                     help="Maximum X gap between consecutive text-arc centres "
+                          "(multiple of avg radius, default 4.0)")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -380,6 +396,11 @@ def main(argv=None) -> int:
         structure_cleanup=args.structure_cleanup,
         structure_line_tolerance=args.structure_line_tolerance,
         quad_detection=not args.no_quad_detection,
+        suppress_text_arcs=args.suppress_text_arcs,
+        text_arc_min_cluster=args.text_arc_min_cluster,
+        text_arc_r_tol=args.text_arc_r_tol,
+        text_arc_y_tol=args.text_arc_y_tol,
+        text_arc_x_gap=args.text_arc_x_gap,
     )
     _detect_boxes = not args.no_detect_boxes
     if args.detect_dashes and _detect_boxes:
