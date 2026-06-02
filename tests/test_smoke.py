@@ -22,6 +22,7 @@ from src.vectorizer import (
     _gap_jump,
     _orthogonalize,
     _detect_dashed_lines,
+    _structure_cleanup_polyline,
 )
 from src.dxf_exporter import _bulge_from_3pts, export_to_dxf as _export
 from src.stroke_width import estimate_line_widths, estimate_contour_widths, _DXF_WEIGHTS

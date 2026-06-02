@@ -865,6 +865,65 @@ def _snap_endpoints(lines: list, radius: float = 4.0) -> list:
     return result
 
 
+# ── Structure cleanup (stub — reserved for future implementation) ─────────────
+
+def _structure_cleanup_polyline(
+    contour_cv2,
+    pts: np.ndarray,
+    closed: bool,
+    line_tolerance: float,
+    quad_detection: bool,
+) -> np.ndarray:
+    """Structural cleanup for nearly-straight and quadrilateral polylines.
+
+    Two operations, neither of which snaps to H/V (diagonal angles preserved):
+
+    1. Quadrilateral preservation (when quad_detection=True):
+       If the contour is closed and has 3–6 detected corners, it is a polygon
+       (e.g. a slanted box).  Return it unchanged so the shape is not lost.
+
+    2. Near-straight simplification:
+       If all interior points lie within *line_tolerance* px of the chord
+       (start→end), collapse the polyline to just [start, end].  This removes
+       scanner-noise wiggles from otherwise straight edges without altering
+       their direction.
+
+    Falls back to returning *pts* unchanged if neither condition applies.
+    """
+    n = len(pts)
+    if n < 2:
+        return pts
+
+    # ── Quadrilateral preservation ────────────────────────────────────────────
+    if quad_detection and closed and n >= 4:
+        work = pts
+        if float(np.hypot(float(pts[0, 0]) - float(pts[-1, 0]),
+                          float(pts[0, 1]) - float(pts[-1, 1]))) < 5.0:
+            work = pts[:-1]  # remove closing duplicate before corner detection
+        corners = _detect_corners(work, threshold_deg=60.0)
+        if 3 <= int(corners.sum()) <= 6:
+            return pts  # keep the polygon as-is
+
+    # ── Near-straight simplification ─────────────────────────────────────────
+    start = pts[0].astype(float)
+    end = pts[-1].astype(float)
+    chord = end - start
+    chord_len = float(np.hypot(chord[0], chord[1]))
+    if chord_len < 1e-9:
+        return pts
+
+    perp = np.array([-chord[1], chord[0]]) / chord_len  # perpendicular unit
+    interior = pts[1:-1].astype(float)
+    if len(interior) == 0:
+        return pts
+
+    deviations = np.abs((interior - start) @ perp)
+    if float(np.max(deviations)) <= line_tolerance:
+        return np.array([pts[0], pts[-1]])  # collapse to chord endpoints
+
+    return pts
+
+
 # ── Rectangular contour detection ────────────────────────────────────────────
 
 def _is_rectangular(pts: np.ndarray, angle_tol_deg: float = 20.0) -> bool:
