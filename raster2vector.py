@@ -11,7 +11,7 @@ import numpy as np
 
 from src.preprocessor import load_and_preprocess
 from src.text_separator import separate_text_and_graphics
-from src.vectorizer import extract_lines_and_contours
+from src.vectorizer import extract_lines_and_contours, compute_page_border
 from src.dxf_exporter import export_to_dxf
 from src.stroke_width import estimate_line_widths, estimate_contour_widths
 
@@ -178,6 +178,22 @@ def build_parser() -> argparse.ArgumentParser:
     vec.add_argument("--max-dash-len", type=float, default=40.0, metavar="PX",
                      help="Maximum segment length (pixels) to consider as a dash "
                           "candidate for dashed-line detection (default 40).")
+    vec.add_argument("--no-detect-boxes", action="store_true",
+                     help="Disable rectangular closed-contour classification "
+                          "(keep all contours on the CONTOURS layer)")
+    vec.add_argument("--box-angle-tol", type=float, default=20.0, metavar="DEG",
+                     help="Max angle deviation from 0°/90° for a contour segment "
+                          "to be considered part of a rectangle (default 20°)")
+    vec.add_argument("--no-consolidate", action="store_true",
+                     help="Disable cross-contour segment consolidation "
+                          "(skip merging near-duplicate parallel segments)")
+    vec.add_argument("--consolidate-perp-tol", type=float, default=6.0, metavar="PX",
+                     help="Perpendicular distance tolerance for segment consolidation "
+                          "(default 6 px)")
+    vec.add_argument("--consolidate-angle-tol", type=float, default=4.0, metavar="DEG",
+                     help="Angle tolerance for segment consolidation (default 4°)")
+    vec.add_argument("--no-page-border", action="store_true",
+                     help="Do not emit the outermost bounding rectangle on the BOX layer")
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("output")
@@ -310,6 +326,7 @@ def main(argv=None) -> int:
 
     # ── 3. Vectorise ───────────────────────────────────────────────────────────
     dashed_lines: list = []
+    box_contours: list = []
     _vec_result = extract_lines_and_contours(
         binary,
         gray=gray,
@@ -346,15 +363,26 @@ def main(argv=None) -> int:
         ortho_accuracy_deg=args.ortho_accuracy,
         detect_dashes=args.detect_dashes,
         max_dash_len_px=args.max_dash_len,
+        detect_boxes=not args.no_detect_boxes,
+        box_angle_tol=args.box_angle_tol,
+        consolidate=not args.no_consolidate,
+        consolidate_perp_tol=args.consolidate_perp_tol,
+        consolidate_angle_tol=args.consolidate_angle_tol,
     )
-    if args.detect_dashes:
+    _detect_boxes = not args.no_detect_boxes
+    if args.detect_dashes and _detect_boxes:
+        lines, contours, arcs, dashed_lines, box_contours = _vec_result
+    elif args.detect_dashes:
         lines, contours, arcs, dashed_lines = _vec_result
+    elif _detect_boxes:
+        lines, contours, arcs, box_contours = _vec_result
     else:
         lines, contours, arcs = _vec_result
 
     if args.verbose:
         print(f"Lines: {len(lines)}  Contours: {len(contours)}  "
-              f"Arcs: {len(arcs)}  Dashes: {len(dashed_lines)}")
+              f"Arcs: {len(arcs)}  Dashes: {len(dashed_lines)}  "
+              f"Boxes: {len(box_contours)}")
 
     # ── 3b. Stroke-width estimation (SPV) ──────────────────────────────────────
     line_weights: Optional[list] = None
@@ -386,6 +414,8 @@ def main(argv=None) -> int:
             line_weights=line_weights,
             contour_weights=contour_weights,
             dashed_lines=dashed_lines,
+            box_contours=box_contours,
+            page_border=compute_page_border(lines, contours) if not args.no_page_border else None,
         )
     except (OSError, IOError) as exc:
         print(f"Error: could not write DXF to '{args.output}' — {exc}", file=sys.stderr)

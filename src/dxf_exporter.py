@@ -34,6 +34,8 @@ _LAYERS = [
     ("TEXT_CANDIDATES",  2),   # yellow      — text-string blobs
     ("NOISE_REJECTED",   8),   # dark grey   — below noise threshold
     ("DASHED",           1),   # red         — detected dashed / hidden lines
+    ("BOXES",            4),   # cyan        — detected rectangular closed regions
+    ("BOX",              7),   # white/black — outermost drawing border
 ]
 
 # Standard DXF DASHED linetype pattern (dash=0.5, gap=0.25 drawing units)
@@ -112,6 +114,8 @@ def export_to_dxf(
     contour_weights: list | None = None,
     elongated_contours: list | None = None,
     dashed_lines: list | None = None,
+    box_contours: list | None = None,
+    page_border: tuple | None = None,
 ) -> int:
     """Export detected geometry to a DXF file.
 
@@ -273,6 +277,27 @@ def export_to_dxf(
             msp.add_lwpolyline(pts, close=closed,
                                dxfattribs={"layer": "TEXT_CANDIDATES"})
             entity_count += 1
+
+    # ── Rectangular annotation boxes ──────────────────────────────────────────
+    for bc in (box_contours or []):
+        pts = [px(float(p[0]), float(p[1])) for p in bc]
+        if len(pts) >= 2:
+            first, last = bc[0].astype(float), bc[-1].astype(float)
+            closed = bool(np.linalg.norm(first - last) < 4.0)
+            msp.add_lwpolyline(pts, close=closed,
+                               dxfattribs={"layer": "BOXES"})
+            entity_count += 1
+
+    # ── Outermost drawing border ───────────────────────────────────────────────
+    if page_border is not None:
+        x_min, y_min, x_max, y_max = page_border
+        p1 = px(x_min, y_min)
+        p2 = px(x_max, y_min)
+        p3 = px(x_max, y_max)
+        p4 = px(x_min, y_max)
+        msp.add_lwpolyline([p1, p2, p3, p4], close=True,
+                           dxfattribs={"layer": "BOX"})
+        entity_count += 1
 
     doc.saveas(output_path)
     return entity_count

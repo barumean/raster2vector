@@ -865,6 +865,288 @@ def _snap_endpoints(lines: list, radius: float = 4.0) -> list:
     return result
 
 
+# ── Rectangular contour detection ────────────────────────────────────────────
+
+def _is_rectangular(pts: np.ndarray, angle_tol_deg: float = 20.0) -> bool:
+    """Return True if *pts* is a closed contour shaped like a rectangle.
+
+    Criterion: 3–6 corners (detected at ≥ 60°), and every inter-corner segment
+    is within *angle_tol_deg* of horizontal or vertical.
+
+    This distinguishes axis-aligned boxes (section-view annotation boxes,
+    legend boxes) from arbitrary curved or diagonal contours.
+    """
+    if len(pts) < 4:
+        return False
+    # For closed contours the last point nearly coincides with the first.
+    # Remove it so _detect_corners sees the wrap-around angle correctly.
+    work = pts
+    if (len(pts) > 4 and
+            float(np.hypot(float(pts[0, 0]) - float(pts[-1, 0]),
+                           float(pts[0, 1]) - float(pts[-1, 1]))) < 5.0):
+        work = pts[:-1]
+    if len(work) < 4:
+        return False
+    corners = _detect_corners(work, threshold_deg=60.0)
+    n = int(corners.sum())
+    if not (3 <= n <= 6):
+        return False
+    idx = np.where(corners)[0]
+    for k in range(len(idx)):
+        a = work[idx[k]].astype(float)
+        b = work[idx[(k + 1) % len(idx)]].astype(float)
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        if math.hypot(dx, dy) < 1.0:
+            continue
+        angle_deg = abs(math.degrees(math.atan2(dy, dx))) % 90.0
+        if min(angle_deg, 90.0 - angle_deg) > angle_tol_deg:
+            return False
+    return True
+
+
+# ── Cross-contour segment consolidation ──────────────────────────────────────
+
+def _seg_props(x1: float, y1: float, x2: float, y2: float):
+    """Return (angle_rad, length, mid_x, mid_y, perp_unit) for a segment."""
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    angle = math.atan2(dy, dx) % math.pi
+    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    # Perpendicular unit vector (rotated 90° CCW)
+    return angle, length, mx, my, (-sin_a, cos_a), (cos_a, sin_a)
+
+
+def _consolidate_segments(
+    lines: list,
+    contours: list,
+    angle_tol_deg: float = 4.0,
+    perp_tol_px: float = 6.0,
+    len_ratio_tol: float = 0.35,
+    overlap_frac: float = 0.5,
+    max_line_deviation: float = 2.0,
+) -> tuple[list, list]:
+    """Merge near-identical segments across lines and contour edges.
+
+    Algorithm (vtracer corner segmentation + Dori&Liu direction grouping):
+
+    1. Decompose every contour into inter-corner "edge segments" (straight
+       chords between detected corner points).
+    2. Pool those chords with the existing LINE entities.
+    3. Group by angle bin (direction-invariant, like _detect_dashed_lines).
+    4. Within each group, sub-cluster by perpendicular offset (rho bin).
+    5. Within each rho cluster, merge segments whose along-axis ranges
+       overlap by ≥ overlap_frac of the shorter segment's length AND whose
+       lengths differ by ≤ len_ratio_tol.
+    6. Contour edge segments that were absorbed into a merged LINE are
+       removed from their parent contour (the parent is rebuilt from the
+       remaining points).  Contours that become too short are dropped.
+
+    Args:
+        lines:            Existing LINE list [(x1,y1,x2,y2), …].
+        contours:         Contour list [ndarray(N,2), …].
+        angle_tol_deg:    Angular bin half-width for direction grouping.
+        perp_tol_px:      Perpendicular-distance tolerance for same-axis bin.
+        len_ratio_tol:    Max relative length difference to consider similar.
+        overlap_frac:     Min fraction of the shorter segment that must overlap.
+        max_line_deviation: Deviation threshold for classifying a contour
+                            segment as "straight" before comparing to lines.
+
+    Returns:
+        (merged_lines, remaining_contours)
+    """
+    if not lines and not contours:
+        return lines, contours
+
+    angle_step = math.radians(angle_tol_deg)
+    n_bins = max(1, int(math.pi / angle_step))
+
+    # ── Collect all candidate segments ───────────────────────────────────────
+    # Each entry: (x1,y1,x2,y2, source_type, source_idx, seg_idx_in_source)
+    # source_type: 'line' or 'contour'
+    all_segs: list[tuple] = []
+
+    for li, seg in enumerate(lines):
+        x1, y1, x2, y2 = (float(seg[0]), float(seg[1]),
+                           float(seg[2]), float(seg[3]))
+        pr = _seg_props(x1, y1, x2, y2)
+        if pr is None:
+            continue
+        angle, length, mx, my, perp_uv, along_uv = pr
+        all_segs.append((x1, y1, x2, y2, angle, length, mx, my,
+                         perp_uv, along_uv, 'line', li, -1))
+
+    # Extract inter-corner edge segments from contours
+    contour_seg_map: dict[int, list[tuple[int, int]]] = {}  # ci → [(start_pt_idx, end_pt_idx)]
+    for ci, pts in enumerate(contours):
+        n = len(pts)
+        if n < 2:
+            continue
+        corners = _detect_corners(pts, threshold_deg=55.0)
+        corner_idx = list(np.where(corners)[0])
+        if not corner_idx:
+            corner_idx = [0, n - 1]
+        else:
+            if 0 not in corner_idx:
+                corner_idx = [0] + corner_idx
+            if n - 1 not in corner_idx:
+                corner_idx.append(n - 1)
+
+        segs_for_ci = []
+        for k in range(len(corner_idx) - 1):
+            si = corner_idx[k]
+            ei = corner_idx[k + 1]
+            seg_pts = pts[si:ei + 1]
+            if len(seg_pts) < 2:
+                continue
+            # Only consider near-straight segments (not curved ones)
+            if not _is_straight(seg_pts, max_line_deviation * 2.5):
+                continue
+            x1, y1 = float(seg_pts[0, 0]), float(seg_pts[0, 1])
+            x2, y2 = float(seg_pts[-1, 0]), float(seg_pts[-1, 1])
+            pr = _seg_props(x1, y1, x2, y2)
+            if pr is None:
+                continue
+            angle, length, mx, my, perp_uv, along_uv = pr
+            all_segs.append((x1, y1, x2, y2, angle, length, mx, my,
+                             perp_uv, along_uv, 'contour', ci, len(segs_for_ci)))
+            segs_for_ci.append((si, ei))
+        contour_seg_map[ci] = segs_for_ci
+
+    if not all_segs:
+        return lines, contours
+
+    # ── Group by angle bin ────────────────────────────────────────────────────
+    bins: dict[int, list[int]] = {}
+    for idx, seg in enumerate(all_segs):
+        angle = seg[4]
+        bk = int(angle / angle_step) % n_bins
+        bins.setdefault(bk, []).append(idx)
+
+    absorbed_line_idx: set[int] = set()
+    absorbed_contour_segs: dict[int, set[int]] = {}  # ci → set of seg_k absorbed
+
+    for bin_members in bins.values():
+        if len(bin_members) < 2:
+            continue
+        # Median reference angle for stable projection
+        ref_angle = float(np.median([all_segs[i][4] for i in bin_members]))
+        cos_r, sin_r = math.cos(ref_angle), math.sin(ref_angle)
+        perp_x, perp_y = -sin_r, cos_r
+
+        # Sub-cluster by perpendicular offset
+        rho_clusters: dict[int, list[int]] = {}
+        for idx in bin_members:
+            seg = all_segs[idx]
+            mx, my = seg[6], seg[7]
+            rho = mx * perp_x + my * perp_y
+            rho_bin = int(round(rho / perp_tol_px))
+            rho_clusters.setdefault(rho_bin, []).append(idx)
+
+        for cluster_idxs in rho_clusters.values():
+            if len(cluster_idxs) < 2:
+                continue
+            # Sort by along-axis position
+            along = [all_segs[i][6] * cos_r + all_segs[i][7] * sin_r
+                     for i in cluster_idxs]
+            order = sorted(range(len(cluster_idxs)), key=lambda k: along[k])
+            sorted_idxs = [cluster_idxs[k] for k in order]
+
+            # Find the dominant segment (longest) in the cluster to keep
+            # Absorb shorter near-duplicate segments
+            longest_idx = max(sorted_idxs, key=lambda i: all_segs[i][5])
+            dominant = all_segs[longest_idx]
+            dom_lo = dominant[6] * cos_r + dominant[7] * sin_r - dominant[5] / 2
+            dom_hi = dom_lo + dominant[5]
+
+            for idx in sorted_idxs:
+                if idx == longest_idx:
+                    continue
+                seg = all_segs[idx]
+                seg_len = seg[5]
+                seg_pos = seg[6] * cos_r + seg[7] * sin_r
+                seg_lo = seg_pos - seg_len / 2
+                seg_hi = seg_pos + seg_len / 2
+
+                # Length ratio check
+                if abs(dominant[5] - seg_len) / max(dominant[5], seg_len) > len_ratio_tol:
+                    continue
+
+                # Overlap check along axis
+                overlap = max(0.0, min(dom_hi, seg_hi) - max(dom_lo, seg_lo))
+                if overlap / seg_len < overlap_frac:
+                    continue
+
+                # This segment is near-duplicate → absorb
+                src_type, src_li, seg_k = seg[10], seg[11], seg[12]
+                if src_type == 'line':
+                    if src_li != longest_idx or all_segs[longest_idx][10] != 'line':
+                        absorbed_line_idx.add(src_li)
+                elif src_type == 'contour':
+                    absorbed_contour_segs.setdefault(src_li, set()).add(seg_k)
+
+    # ── Rebuild lines (drop absorbed) ────────────────────────────────────────
+    new_lines = [seg for li, seg in enumerate(lines)
+                 if li not in absorbed_line_idx]
+
+    # ── Rebuild contours (drop absorbed edge segments) ────────────────────────
+    new_contours = []
+    for ci, pts in enumerate(contours):
+        absorbed_ks = absorbed_contour_segs.get(ci, set())
+        if not absorbed_ks:
+            new_contours.append(pts)
+            continue
+        segs_for_ci = contour_seg_map.get(ci, [])
+        if not segs_for_ci:
+            new_contours.append(pts)
+            continue
+        # Build a mask of point indices to keep: drop points that lie
+        # exclusively inside absorbed segments (keep all corner endpoints)
+        corner_pts: set[int] = set()
+        for k, (si, ei) in enumerate(segs_for_ci):
+            corner_pts.add(si)
+            corner_pts.add(ei)
+        drop_interior: set[int] = set()
+        for k in absorbed_ks:
+            si, ei = segs_for_ci[k]
+            for pi in range(si + 1, ei):  # interior points only
+                if pi not in corner_pts or all(
+                    pi not in range(segs_for_ci[j][0], segs_for_ci[j][1] + 1)
+                    for j in range(len(segs_for_ci)) if j not in absorbed_ks
+                ):
+                    drop_interior.add(pi)
+        keep_mask = [i for i in range(len(pts)) if i not in drop_interior]
+        if len(keep_mask) >= 2:
+            new_contours.append(pts[keep_mask])
+
+    return new_lines, new_contours
+
+
+# ── Page border detection ─────────────────────────────────────────────────────
+
+def compute_page_border(
+    lines: list,
+    contours: list,
+    margin_px: float = 5.0,
+) -> tuple[float, float, float, float] | None:
+    """Return the bounding rectangle (x_min, y_min, x_max, y_max) in pixels.
+
+    Encompasses all detected geometry with a small outward margin.
+    Returns None if no geometry is present.
+    """
+    xs, ys = [], []
+    for x1, y1, x2, y2 in lines:
+        xs += [x1, x2]; ys += [y1, y2]
+    for pts in contours:
+        xs += list(pts[:, 0]); ys += list(pts[:, 1])
+    if not xs:
+        return None
+    return (min(xs) - margin_px, min(ys) - margin_px,
+            max(xs) + margin_px, max(ys) + margin_px)
+
+
 # ── Main extraction pipeline ──────────────────────────────────────────────────
 
 def extract_lines_and_contours(
@@ -911,6 +1193,13 @@ def extract_lines_and_contours(
     ortho_accuracy_deg: float = 2.0,
     detect_dashes: bool = False,
     max_dash_len_px: float = 40.0,
+    # Geometry classification
+    detect_boxes: bool = False,
+    box_angle_tol: float = 20.0,
+    # Cross-contour segment consolidation
+    consolidate: bool = False,
+    consolidate_perp_tol: float = 6.0,
+    consolidate_angle_tol: float = 4.0,
 ):
     """Extract LINE segments and LWPOLYLINE contours from a drawing image.
 
@@ -1180,13 +1469,43 @@ def extract_lines_and_contours(
             lines, max_dash_len_px=max_dash_len_px,
         )
 
+    # ── Step 9: Cross-contour segment consolidation ───────────────────────────
+    # Merge near-identical line segments across lines and contour edges.
+    if consolidate and (lines or contours):
+        lines, contours = _consolidate_segments(
+            lines, contours,
+            angle_tol_deg=consolidate_angle_tol,
+            perp_tol_px=consolidate_perp_tol,
+        )
+
+    # ── Step 10: Classify rectangular closed contours → BOXES ─────────────────
+    box_contours: list = []
+    if detect_boxes:
+        remaining: list = []
+        for pts in contours:
+            closed = bool(np.linalg.norm(
+                pts[0].astype(float) - pts[-1].astype(float)) < 4.0)
+            if closed and _is_rectangular(pts, angle_tol_deg=box_angle_tol):
+                box_contours.append(pts)
+            else:
+                remaining.append(pts)
+        contours = remaining
+
     if return_arcs:
         arcs = _dedup_circles(arcs)
+        if detect_dashes and detect_boxes:
+            return lines, contours, arcs, dashed_lines, box_contours
         if detect_dashes:
             return lines, contours, arcs, dashed_lines
+        if detect_boxes:
+            return lines, contours, arcs, box_contours
         return lines, contours, arcs
+    if detect_dashes and detect_boxes:
+        return lines, contours, dashed_lines, box_contours
     if detect_dashes:
         return lines, contours, dashed_lines
+    if detect_boxes:
+        return lines, contours, box_contours
     return lines, contours
 
 

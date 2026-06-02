@@ -785,3 +785,68 @@ def test_detect_dashes_cli(square_image_path, dxf_out):
     from raster2vector import main
     ret = main([square_image_path, "-o", dxf_out, "--detect-dashes"])
     assert ret == 0
+
+
+# ── Box detection, consolidation, page-border tests ───────────────────────────
+
+def test_is_rectangular_detects_box():
+    """_is_rectangular returns True for an axis-aligned rectangle."""
+    from src.vectorizer import _is_rectangular
+    pts = np.array([[10, 10], [10, 60], [80, 60], [80, 10], [10, 10]])
+    assert _is_rectangular(pts, angle_tol_deg=20.0)
+
+
+def test_is_rectangular_rejects_triangle():
+    """_is_rectangular returns False for a triangle."""
+    from src.vectorizer import _is_rectangular
+    pts = np.array([[0, 0], [50, 0], [25, 40], [0, 0]])
+    assert not _is_rectangular(pts, angle_tol_deg=20.0)
+
+
+def test_detect_boxes_classifies_rectangle():
+    """extract_lines_and_contours with detect_boxes=True puts closed rects in box_contours."""
+    img = np.zeros((200, 200), dtype=np.uint8)
+    cv2.rectangle(img, (20, 20), (100, 80), 255, 2)
+    result = extract_lines_and_contours(img, detect_boxes=True)
+    lines, contours, box_contours = result
+    assert len(box_contours) >= 1, "Rectangular closed contour should be in box_contours"
+
+
+def test_compute_page_border_coverage():
+    """compute_page_border returns a rect that encloses all line endpoints."""
+    from src.vectorizer import compute_page_border
+    lines = [(10, 20, 80, 50), (5, 5, 90, 90)]
+    border = compute_page_border(lines, [])
+    assert border is not None
+    x1, y1, x2, y2 = border
+    assert x1 <= 5 and y1 <= 5
+    assert x2 >= 90 and y2 >= 90
+
+
+def test_box_and_border_in_dxf(tmp_path):
+    """BOX and BOXES layers appear in DXF when page_border and box_contours are given."""
+    out = str(tmp_path / "box.dxf")
+    box_pts = np.array([[10, 10], [10, 60], [80, 60], [80, 10], [10, 10]])
+    export_to_dxf(
+        lines=[(0, 0, 100, 0)], contours=[], output_path=out, image_height=100,
+        box_contours=[box_pts], page_border=(0, 0, 100, 100),
+    )
+    doc = ezdxf.readfile(out)
+    layer_names = {e.dxf.layer for e in doc.modelspace()}
+    assert "BOX" in layer_names
+    assert "BOXES" in layer_names
+
+
+def test_consolidate_removes_duplicate_parallel():
+    """_consolidate_segments absorbs a near-duplicate contour segment."""
+    from src.vectorizer import _consolidate_segments
+    lines = [(0, 0, 100, 0)]  # horizontal line at y=0
+    # Contour: a near-identical segment at y=3 (within perp_tol)
+    dup_contour = np.array([[0, 3], [50, 3], [100, 3]])
+    remaining_lines, remaining_contours = _consolidate_segments(
+        lines, [dup_contour], perp_tol_px=6.0, angle_tol_deg=4.0,
+    )
+    # The duplicate contour segment should have been absorbed (contour removed or shortened)
+    total_contour_pts = sum(len(c) for c in remaining_contours)
+    assert total_contour_pts < len(dup_contour), \
+        "Near-duplicate contour segment should be absorbed into the line"
