@@ -2055,26 +2055,39 @@ def _suppress_text_arcs(
         y_tol = y_tol_ratio * avg_r
         x_max_gap = x_gap_ratio * avg_r
 
-        # Sort by X, then scan for horizontal runs
-        group_x = sorted(group, key=lambda p: p[0])
-        run_start = 0
-        for k in range(1, len(group_x) + 1):
-            end_of_input = k == len(group_x)
-            if not end_of_input:
-                cx_prev, cy_prev = group_x[k - 1][0], group_x[k - 1][1]
-                cx_curr, cy_curr = group_x[k][0], group_x[k][1]
-                x_gap = cx_curr - cx_prev
-                y_diff = abs(cy_curr - cy_prev)
-                still_in_run = x_gap <= x_max_gap and y_diff <= y_tol
-            else:
-                still_in_run = False
+        # Split the radius group into Y bands (text rows) FIRST, so that
+        # multiple rows of text do not interleave when sorted by X.
+        group_y = sorted(group, key=lambda p: p[1])
+        rows: list[list] = []
+        row_start = 0
+        for k in range(1, len(group_y) + 1):
+            if k == len(group_y) or group_y[k][1] - group_y[k - 1][1] > y_tol:
+                rows.append(group_y[row_start:k])
+                row_start = k
 
-            if not still_in_run:
-                run_len = k - run_start
-                if run_len >= min_cluster:
-                    for m in range(run_start, k):
-                        text_indices.add(group_x[m][3])
-                run_start = k
+        for row in rows:
+            if len(row) < min_cluster:
+                continue
+            # Sort by X within the row, then scan for horizontal runs
+            group_x = sorted(row, key=lambda p: p[0])
+            run_start = 0
+            for k in range(1, len(group_x) + 1):
+                end_of_input = k == len(group_x)
+                if not end_of_input:
+                    cx_prev, cy_prev = group_x[k - 1][0], group_x[k - 1][1]
+                    cx_curr, cy_curr = group_x[k][0], group_x[k][1]
+                    x_gap = cx_curr - cx_prev
+                    y_diff = abs(cy_curr - cy_prev)
+                    still_in_run = x_gap <= x_max_gap and y_diff <= y_tol
+                else:
+                    still_in_run = False
+
+                if not still_in_run:
+                    run_len = k - run_start
+                    if run_len >= min_cluster:
+                        for m in range(run_start, k):
+                            text_indices.add(group_x[m][3])
+                    run_start = k
 
     for i in text_indices:
         arcs[i] = {**arcs[i], "text_candidate": True}

@@ -890,3 +890,49 @@ def test_consolidate_removes_duplicate_parallel():
     total_contour_pts = sum(len(c) for c in remaining_contours)
     assert total_contour_pts < len(dup_contour), \
         "Near-duplicate contour segment should be absorbed into the line"
+
+
+# ── Text-arc suppression ──────────────────────────────────────────────────────
+
+def test_suppress_text_arcs_single_row():
+    """A horizontal row of similar-radius circles is flagged as text."""
+    from src.vectorizer import _suppress_text_arcs
+    arcs = [{"type": "circle", "center": (float(cx), 100.0), "r": 20.0}
+            for cx in (100, 200, 300, 400)]
+    arcs.append({"type": "circle", "center": (500.0, 400.0), "r": 80.0})
+    result = _suppress_text_arcs(arcs, min_cluster=3)
+    flagged = [a for a in result if a.get("text_candidate")]
+    assert len(flagged) == 4
+    assert not result[-1].get("text_candidate"), \
+        "standalone large circle must stay on ARCS"
+
+
+def test_suppress_text_arcs_multi_row():
+    """Two interleaved text rows of the same radius are each detected.
+
+    Regression: rows sharing one radius group used to interleave when sorted
+    by X, breaking the run scan so nothing was ever flagged.
+    """
+    from src.vectorizer import _suppress_text_arcs
+    arcs = []
+    for cx in (180, 235, 290, 345, 400):          # row 1 at y=250
+        arcs.append({"type": "circle", "center": (float(cx), 250.0), "r": 16.0})
+    for cx in (200, 260, 320, 380, 440):           # row 2 at y=150, similar r
+        arcs.append({"type": "circle", "center": (float(cx), 150.0), "r": 19.0})
+    result = _suppress_text_arcs(arcs, min_cluster=3)
+    flagged = sum(1 for a in result if a.get("text_candidate"))
+    assert flagged == 10, f"both rows should be flagged, got {flagged}/10"
+
+
+def test_suppress_text_arcs_routes_to_layer(tmp_path):
+    """text_candidate arcs are written to the TEXT_ARCS layer in the DXF."""
+    import ezdxf
+    arcs = [{"type": "circle", "center": (float(cx), 100.0), "r": 20.0,
+             "text_candidate": True} for cx in (100, 200, 300)]
+    arcs.append({"type": "circle", "center": (500.0, 300.0), "r": 50.0})
+    out = str(tmp_path / "text_arcs.dxf")
+    export_to_dxf([], [], out, image_height=400, arcs=arcs)
+    doc = ezdxf.readfile(out)
+    layers = [e.dxf.layer for e in doc.modelspace()]
+    assert layers.count("TEXT_ARCS") == 3
+    assert layers.count("ARCS") == 1
